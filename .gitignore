@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+**/.venv/
+venv/
+env/
+
+# Node / Frida agent dependencies
+**/node_modules/
+frida_agent/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build and temporary outputs
+dist/
+build/
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Local traces and analysis outputs
+trace/
+traces/
+*.trace
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.suo
+*.user
+Thumbs.db
+Desktop.ini
+
+# Local-only project clutter
+old/
+agent/
+
+# Runtime bundle note:
+# frida_agent/agent.js is intentionally not ignored because bridge_server.py
+# loads it directly at runtime.

@@ -1,0 +1,18 @@
+# 1. 폴더 생성 및 이동
+mkdir frida-ts-agent
+cd frida-ts-agent
+
+# 2. Node.js 프로젝트 초기화
+npm init -y
+
+# 3. TypeScript 및 Frida 타입 정의, 컴파일러 설치
+npm install --save-dev typescript @types/frida-gum frida-compile
+
+
+npx tsc --init
+
+# ESLint 및 TypeScript 플러그인 설치
+npm install --save-dev eslint @typescript-eslint/parser @typescript-eslint/eslint-plugin
+
+# 개발 중에는 소스 변경을 실시간으로 감지하여 컴파일하는 watch 모드를 켜두는 것이 편합니다.
+npm run watch

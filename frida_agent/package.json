@@ -1,0 +1,23 @@
+{
+  "name": "frida_agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build": "frida-compile agent.ts -o agent.js",
+    "watch": "frida-compile agent.ts -w -o agent.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/frida-gum": "^19.0.2",
+    "@typescript-eslint/eslint-plugin": "^8.59.2",
+    "@typescript-eslint/parser": "^8.59.2",
+    "eslint": "^10.3.0",
+    "frida-compile": "^19.0.5",
+    "typescript": "^6.0.3"
+  }
+}
+

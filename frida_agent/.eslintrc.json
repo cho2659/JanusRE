@@ -1,0 +1,29 @@
+{
+  "parser": "@typescript-eslint/parser",
+  "plugins": ["@typescript-eslint"],
+  "extends": [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended"
+  ],
+  "env": {
+    "es2021": true
+  },
+  "globals": {
+    "Interceptor": "readonly",
+    "Module": "readonly",
+    "Memory": "readonly",
+    "Process": "readonly",
+    "Thread": "readonly",
+    "NativeFunction": "readonly",
+    "NativePointer": "readonly",
+    "console": "readonly",
+    "send": "readonly",
+    "recv": "readonly",
+    "rpc": "readonly"
+  },
+  "rules": {
+    "no-console": "off",
+    "@typescript-eslint/no-explicit-any": "warn",
+    "@typescript-eslint/explicit-function-return-type": "off"
+  }
+}

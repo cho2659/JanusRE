@@ -1,0 +1,9 @@
+{
+  "framework": "hyper-waterfall",
+  "version": "0.2.0",
+  "source": "https://github.com/postmelee/hyper-waterfall",
+  "applied_at": "2026-05-23",
+  "repo": "frida_delta",
+  "base_branch": "main",
+  "notes": "Initial adoption. Manual install (no CLI). Skills symlink not applicable on Windows — mydocs/skills is the source of truth."
+}

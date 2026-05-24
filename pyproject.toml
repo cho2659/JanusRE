@@ -1,0 +1,18 @@
+[project]
+name = "delta"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "frida>=17.9.5",
+    "frida-tools>=14.8.2",
+    "mcp>=1.27.1",
+    "networkx>=3.6.1",
+    "pyside6>=6.11.0",
+]
+
+[tool.uv.workspace]
+members = [
+    "ghidra_addon",
+]
