@@ -96,6 +96,15 @@ const g_spawn_events: ThreadSpawnEvent[]  = [];
 const g_stalked:      Set<number>         = new Set();
 const g_attach_failed:Set<number>         = new Set();
 
+type LastExternalCall = {
+  caller_va: string;
+  target_va: string;
+  target_module: string;
+  at_ms: number;
+};
+
+const g_last_external_call_by_tid: Map<number, LastExternalCall> = new Map();
+
 let g_seq     = 0;
 let g_flushed = false;
 let g_started = false;
@@ -112,6 +121,7 @@ let g_targets: Set<string> = new Set();
 
 const SESSION_ID  = generateUUID();
 const MAX_BT      = 24; // 콜스택 역추적 최대 깊이
+const LAST_EXTERNAL_CALL_TTL_MS = 1000;
 const ENABLE_ARG_SNAPSHOTS = false;
 const FAILURE_SCAN_DELAY_MS = 50;
 
@@ -170,6 +180,57 @@ function findTargetCaller(ctx: CpuContext): string {
     rsp = rsp.add(Process.pointerSize);
   }
   return "unknown";
+}
+
+function noteExternalCall(caller: NativePointer, target: NativePointer): void {
+  const targetMod = Process.findModuleByAddress(target);
+  g_last_external_call_by_tid.set(Process.getCurrentThreadId(), {
+    caller_va: ph(caller),
+    target_va: ph(target),
+    target_module: targetMod ? targetMod.name.toLowerCase() : "unknown",
+    at_ms: Date.now(),
+  });
+}
+
+function consumeRecentExternalCaller(ctx: CpuContext): string {
+  const tid = Process.getCurrentThreadId();
+  const last = g_last_external_call_by_tid.get(tid);
+  if (last && Date.now() - last.at_ms <= LAST_EXTERNAL_CALL_TTL_MS) {
+    return last.caller_va;
+  }
+  return findTargetCaller(ctx);
+}
+
+function directCallTarget(instr: X86Instruction): NativePointer | null {
+  const i = instr as any;
+  const operands = i.operands || [];
+  if (operands.length > 0) {
+    const op = operands[0];
+    const value = op.value;
+    if ((op.type === "imm" || op.type === "immediate") && value !== undefined) {
+      if (typeof value === "number") return ptr(value);
+      if (typeof value === "string") {
+        try { return ptr(value); } catch (_) { return null; }
+      }
+      try { return value as NativePointer; } catch (_) { return null; }
+    }
+  }
+
+  const opStr = String(i.opStr || "");
+  const m = opStr.match(/0x[0-9a-fA-F]+/);
+  if (!m) return null;
+  try { return ptr(m[0]); } catch (_) { return null; }
+}
+
+function shouldTrackExternalCallsite(instr: X86Instruction): NativePointer | null {
+  const src = (instr as any).address as NativePointer;
+  const srcMod = Process.findModuleByAddress(src);
+  if (!isTarget(srcMod)) return null;
+  const target = directCallTarget(instr);
+  if (!target) return null;
+  const dstMod = Process.findModuleByAddress(target);
+  if (!dstMod || isTarget(dstMod)) return null;
+  return target;
 }
 
 function captureArgs(
@@ -370,22 +431,29 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
           }
         },
 
-        transform: ENABLE_ARG_SNAPSHOTS
-          ? ((iterator: StalkerX86Iterator): void => {
-              let instr: X86Instruction | null;
-              while ((instr = iterator.next()) !== null) {
-                const mn = instr.mnemonic.toLowerCase();
-                if (mn === "call") {
-                  const _tid = tid;
-                  iterator.putCallout((ctx: CpuContext) => {
-                    // seq는 onReceive에서 할당되므로 현재 인덱스로 근사
-                    g_snapshots.push(captureArgs(ctx, g_events.length, _tid));
-                  });
-                }
-                iterator.keep();
+        transform(iterator: StalkerX86Iterator): void {
+          let instr: X86Instruction | null;
+          while ((instr = iterator.next()) !== null) {
+            const mn = instr.mnemonic.toLowerCase();
+            if (mn === "call") {
+              const caller = (instr as any).address as NativePointer;
+              const externalTarget = shouldTrackExternalCallsite(instr);
+              if (externalTarget) {
+                iterator.putCallout(() => {
+                  noteExternalCall(caller, externalTarget);
+                });
               }
-            })
-          : undefined,
+              if (ENABLE_ARG_SNAPSHOTS) {
+                const _tid = tid;
+                iterator.putCallout((ctx: CpuContext) => {
+                  // seq는 onReceive에서 할당되므로 현재 인덱스로 근사
+                  g_snapshots.push(captureArgs(ctx, g_events.length, _tid));
+                });
+              }
+            }
+            iterator.keep();
+          }
+        },
       });
       return true;
     });
@@ -505,7 +573,7 @@ function hookThreadCreation(): void {
       onEnter(args) {
         (this as any)._hp  = args[0]!;
         (this as any)._sv  = ph(args[4]!);
-        (this as any)._cv  = findTargetCaller(this.context);
+        (this as any)._cv  = consumeRecentExternalCaller(this.context);
         (this as any)._pt  = Process.getCurrentThreadId();
       },
       onLeave(rv) {
@@ -522,7 +590,7 @@ function hookThreadCreation(): void {
       onEnter(args) {
         (this as any)._hp = args[0]!;
         (this as any)._sv = "unknown";
-        (this as any)._cv = findTargetCaller(this.context);
+        (this as any)._cv = consumeRecentExternalCaller(this.context);
         (this as any)._pt = Process.getCurrentThreadId();
       },
       onLeave(rv) {
@@ -588,7 +656,7 @@ function hookSync(): void {
           tid:       Process.getCurrentThreadId(),
           kind:      d.kind,
           handle:    d.handle(args),
-          caller_va: findTargetCaller(this.context),
+          caller_va: consumeRecentExternalCaller(this.context),
         };
         if (d.extra) d.extra(args, ev);
         g_sync_events.push(ev as SyncEvent);
@@ -626,7 +694,7 @@ function hookUserInput(): void {
   const getMsgAddr = u32.findExportByName("GetMessageW");
   if (getMsgAddr) {
     Interceptor.attach(getMsgAddr, {
-      onEnter(args) { (this as any)._lp = args[0]!; (this as any)._cv = findTargetCaller(this.context); },
+      onEnter(args) { (this as any)._lp = args[0]!; (this as any)._cv = consumeRecentExternalCaller(this.context); },
       onLeave(rv) {
         if (rv.toInt32() <= 0) return;
         const m = readMsg((this as any)._lp);
@@ -641,7 +709,7 @@ function hookUserInput(): void {
   const peekMsgAddr = u32.findExportByName("PeekMessageW");
   if (peekMsgAddr) {
     Interceptor.attach(peekMsgAddr, {
-      onEnter(args) { (this as any)._lp = args[0]!; (this as any)._cv = findTargetCaller(this.context); },
+      onEnter(args) { (this as any)._lp = args[0]!; (this as any)._cv = consumeRecentExternalCaller(this.context); },
       onLeave(rv) {
         if (rv.toInt32() === 0) return;
         const m = readMsg((this as any)._lp);
@@ -659,7 +727,7 @@ function hookUserInput(): void {
     Interceptor.attach(postMsg, {
       onEnter(args) {
         g_sync_events.push({ seq: nextSeq(), tid: Process.getCurrentThreadId(),
-          kind: "post_message", handle: ph(args[0]!), caller_va: findTargetCaller(this.context),
+          kind: "post_message", handle: ph(args[0]!), caller_va: consumeRecentExternalCaller(this.context),
           msg_id: args[1]!.toInt32(), wparam: ph(args[2]!), lparam: ph(args[3]!) });
       },
     });
@@ -671,7 +739,7 @@ function hookUserInput(): void {
     Interceptor.attach(sendMsg, {
       onEnter(args) {
         g_sync_events.push({ seq: nextSeq(), tid: Process.getCurrentThreadId(),
-          kind: "send_message", handle: ph(args[0]!), caller_va: findTargetCaller(this.context),
+          kind: "send_message", handle: ph(args[0]!), caller_va: consumeRecentExternalCaller(this.context),
           msg_id: args[1]!.toInt32(), wparam: ph(args[2]!), lparam: ph(args[3]!) });
       },
     });

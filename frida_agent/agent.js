@@ -1,5 +1,5 @@
 📦
-23294 /agent.js
+25788 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -27,6 +27,7 @@ var require_agent = __commonJS({
     var g_spawn_events = [];
     var g_stalked = /* @__PURE__ */ new Set();
     var g_attach_failed = /* @__PURE__ */ new Set();
+    var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_seq = 0;
     var g_flushed = false;
     var g_started = false;
@@ -40,6 +41,7 @@ var require_agent = __commonJS({
     var g_targets = /* @__PURE__ */ new Set();
     var SESSION_ID = generateUUID();
     var MAX_BT = 24;
+    var LAST_EXTERNAL_CALL_TTL_MS = 1e3;
     var ENABLE_ARG_SNAPSHOTS = false;
     var FAILURE_SCAN_DELAY_MS = 50;
     function generateUUID() {
@@ -92,6 +94,69 @@ var require_agent = __commonJS({
         rsp = rsp.add(Process.pointerSize);
       }
       return "unknown";
+    }
+    function noteExternalCall(caller, target) {
+      const targetMod = Process.findModuleByAddress(target);
+      g_last_external_call_by_tid.set(Process.getCurrentThreadId(), {
+        caller_va: ph(caller),
+        target_va: ph(target),
+        target_module: targetMod ? targetMod.name.toLowerCase() : "unknown",
+        at_ms: Date.now()
+      });
+    }
+    function consumeRecentExternalCaller(ctx) {
+      const tid = Process.getCurrentThreadId();
+      const last = g_last_external_call_by_tid.get(tid);
+      if (last && Date.now() - last.at_ms <= LAST_EXTERNAL_CALL_TTL_MS) {
+        return last.caller_va;
+      }
+      return findTargetCaller(ctx);
+    }
+    function directCallTarget(instr) {
+      const i = instr;
+      const operands = i.operands || [];
+      if (operands.length > 0) {
+        const op = operands[0];
+        const value = op.value;
+        if ((op.type === "imm" || op.type === "immediate") && value !== void 0) {
+          if (typeof value === "number")
+            return ptr(value);
+          if (typeof value === "string") {
+            try {
+              return ptr(value);
+            } catch (_) {
+              return null;
+            }
+          }
+          try {
+            return value;
+          } catch (_) {
+            return null;
+          }
+        }
+      }
+      const opStr = String(i.opStr || "");
+      const m = opStr.match(/0x[0-9a-fA-F]+/);
+      if (!m)
+        return null;
+      try {
+        return ptr(m[0]);
+      } catch (_) {
+        return null;
+      }
+    }
+    function shouldTrackExternalCallsite(instr) {
+      const src = instr.address;
+      const srcMod = Process.findModuleByAddress(src);
+      if (!isTarget(srcMod))
+        return null;
+      const target = directCallTarget(instr);
+      if (!target)
+        return null;
+      const dstMod = Process.findModuleByAddress(target);
+      if (!dstMod || isTarget(dstMod))
+        return null;
+      return target;
     }
     function captureArgs(ctx, seq, tid) {
       if (Process.arch === "ia32") {
@@ -283,19 +348,28 @@ var require_agent = __commonJS({
                 });
               }
             },
-            transform: ENABLE_ARG_SNAPSHOTS ? (iterator) => {
+            transform(iterator) {
               let instr;
               while ((instr = iterator.next()) !== null) {
                 const mn = instr.mnemonic.toLowerCase();
                 if (mn === "call") {
-                  const _tid = tid;
-                  iterator.putCallout((ctx) => {
-                    g_snapshots.push(captureArgs(ctx, g_events.length, _tid));
-                  });
+                  const caller = instr.address;
+                  const externalTarget = shouldTrackExternalCallsite(instr);
+                  if (externalTarget) {
+                    iterator.putCallout(() => {
+                      noteExternalCall(caller, externalTarget);
+                    });
+                  }
+                  if (ENABLE_ARG_SNAPSHOTS) {
+                    const _tid = tid;
+                    iterator.putCallout((ctx) => {
+                      g_snapshots.push(captureArgs(ctx, g_events.length, _tid));
+                    });
+                  }
                 }
                 iterator.keep();
               }
-            } : void 0
+            }
           });
           return true;
         });
@@ -395,7 +469,7 @@ var require_agent = __commonJS({
           onEnter(args) {
             this._hp = args[0];
             this._sv = ph(args[4]);
-            this._cv = findTargetCaller(this.context);
+            this._cv = consumeRecentExternalCaller(this.context);
             this._pt = Process.getCurrentThreadId();
           },
           onLeave(rv) {
@@ -410,7 +484,7 @@ var require_agent = __commonJS({
           onEnter(args) {
             this._hp = args[0];
             this._sv = "unknown";
-            this._cv = findTargetCaller(this.context);
+            this._cv = consumeRecentExternalCaller(this.context);
             this._pt = Process.getCurrentThreadId();
           },
           onLeave(rv) {
@@ -474,7 +548,7 @@ var require_agent = __commonJS({
               tid: Process.getCurrentThreadId(),
               kind: d.kind,
               handle: d.handle(args),
-              caller_va: findTargetCaller(this.context)
+              caller_va: consumeRecentExternalCaller(this.context)
             };
             if (d.extra)
               d.extra(args, ev);
@@ -508,7 +582,7 @@ var require_agent = __commonJS({
         Interceptor.attach(getMsgAddr, {
           onEnter(args) {
             this._lp = args[0];
-            this._cv = findTargetCaller(this.context);
+            this._cv = consumeRecentExternalCaller(this.context);
           },
           onLeave(rv) {
             if (rv.toInt32() <= 0)
@@ -534,7 +608,7 @@ var require_agent = __commonJS({
         Interceptor.attach(peekMsgAddr, {
           onEnter(args) {
             this._lp = args[0];
-            this._cv = findTargetCaller(this.context);
+            this._cv = consumeRecentExternalCaller(this.context);
           },
           onLeave(rv) {
             if (rv.toInt32() === 0)
@@ -564,7 +638,7 @@ var require_agent = __commonJS({
               tid: Process.getCurrentThreadId(),
               kind: "post_message",
               handle: ph(args[0]),
-              caller_va: findTargetCaller(this.context),
+              caller_va: consumeRecentExternalCaller(this.context),
               msg_id: args[1].toInt32(),
               wparam: ph(args[2]),
               lparam: ph(args[3])
@@ -581,7 +655,7 @@ var require_agent = __commonJS({
               tid: Process.getCurrentThreadId(),
               kind: "send_message",
               handle: ph(args[0]),
-              caller_va: findTargetCaller(this.context),
+              caller_va: consumeRecentExternalCaller(this.context),
               msg_id: args[1].toInt32(),
               wparam: ph(args[2]),
               lparam: ph(args[3])
