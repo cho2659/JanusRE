@@ -1,5 +1,5 @@
 📦
-22305 /agent.js
+23294 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -73,8 +73,10 @@ var require_agent = __commonJS({
       }
     }
     function findTargetCaller(ctx) {
+      const arch = Process.arch;
       const x64 = ctx;
-      let rsp = x64.rsp;
+      const ia32 = ctx;
+      let rsp = arch === "ia32" ? ia32.esp : x64.rsp;
       for (let i = 0; i < MAX_BT; i++) {
         let ra;
         try {
@@ -87,16 +89,42 @@ var require_agent = __commonJS({
         const mod = Process.findModuleByAddress(ra);
         if (mod && g_targets.has(mod.name.toLowerCase()))
           return ph(ra);
-        rsp = rsp.add(8);
+        rsp = rsp.add(Process.pointerSize);
       }
       return "unknown";
     }
     function captureArgs(ctx, seq, tid) {
+      if (Process.arch === "ia32") {
+        const x2 = ctx;
+        const arg0 = x2.esp;
+        const arg1 = x2.esp.add(4);
+        const arg2 = x2.esp.add(8);
+        const arg3 = x2.esp.add(12);
+        const readArg = (p) => {
+          try {
+            return p.readPointer().toString();
+          } catch (_) {
+            return "";
+          }
+        };
+        return {
+          seq,
+          kind: 0,
+          tid,
+          arch: "ia32",
+          rcx: readArg(arg0),
+          rdx: readArg(arg1),
+          r8: readArg(arg2),
+          r9: readArg(arg3),
+          rsp: x2.esp.toString()
+        };
+      }
       const x = ctx;
       return {
         seq,
         kind: 0,
         tid,
+        arch: "x64",
         rcx: x.rcx.toString(),
         rdx: x.rdx.toString(),
         r8: x.r8.toString(),
@@ -461,11 +489,15 @@ var require_agent = __commonJS({
         return;
       const readMsg = (lpMsg) => {
         try {
+          const ps = Process.pointerSize;
+          const msgOff = ps;
+          const wparamOff = ps === 4 ? 8 : 16;
+          const lparamOff = wparamOff + ps;
           return {
             hwnd: ph(lpMsg.readPointer()),
-            msg_id: lpMsg.add(8).readU32(),
-            wparam: ph(lpMsg.add(12).readPointer()),
-            lparam: ph(lpMsg.add(20).readPointer())
+            msg_id: lpMsg.add(msgOff).readU32(),
+            wparam: ph(lpMsg.add(wparamOff).readPointer()),
+            lparam: ph(lpMsg.add(lparamOff).readPointer())
           };
         } catch (_) {
           return null;
@@ -653,11 +685,11 @@ var require_agent = __commonJS({
       }
     };
     (function main() {
-      if (Process.arch !== "x64") {
-        throw new Error("unsupported architecture: " + Process.arch + " (x64 required)");
+      if (Process.arch !== "x64" && Process.arch !== "ia32") {
+        throw new Error("unsupported architecture: " + Process.arch + " (x64/ia32 required)");
       }
       Stalker.queueDrainInterval = 50;
-      send({ type: "status", text: "agent:start session=" + SESSION_ID });
+      send({ type: "status", text: "agent:start session=" + SESSION_ID + " arch=" + Process.arch });
       const mainMod = Process.enumerateModules()[0];
       if (mainMod)
         g_targets.add(mainMod.name.toLowerCase());

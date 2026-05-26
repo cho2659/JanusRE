@@ -58,7 +58,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QPainter, QPen, QBrush, QColor, QFont,
-    QPainterPath, QWheelEvent,
+    QFontMetrics, QPainterPath, QWheelEvent,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
@@ -122,7 +122,7 @@ ARROW_SZ = 7
 class CallNode:
     __slots__ = (
         "node_id", "module", "symbol", "offset",
-        "tid", "call_seq", "depth",
+        "tid", "call_seq", "trace_seq", "depth",
         "args", "retval",
         "children_ids", "parent_id",
         "spawn_tid", "spawned_by_id",
@@ -138,6 +138,7 @@ class CallNode:
         self.offset         = offset
         self.tid            = tid
         self.call_seq       = call_seq
+        self.trace_seq      = call_seq
         self.depth          = depth
         self.args:          Optional[dict] = None
         self.retval:        Optional[str]  = None
@@ -262,6 +263,7 @@ class CallTreeBuilder:
                     call_seq = call_seq,
                     depth    = len(stack),
                 )
+                node.trace_seq = ev.get("seq", call_seq)
                 call_seq += 1
                 if stack:
                     node.parent_id = stack[-1]
@@ -295,12 +297,14 @@ class CallTreeBuilder:
                     call_seq = call_seq,
                     depth    = len(stack),
                 )
+                node.trace_seq = ev.get("seq", call_seq)
                 call_seq += 1
 
                 # enter 스냅샷 (순서 기반)
                 if enter_idx < len(enter_snaps):
                     snap = enter_snaps[enter_idx]
                     node.args = {
+                        "arch": snap.get("arch", "x64"),
                         "rcx": snap.get("rcx", ""),
                         "rdx": snap.get("rdx", ""),
                         "r8":  snap.get("r8",  ""),
@@ -467,6 +471,7 @@ class NodeItem(QGraphicsItem):
         self._node     = node
         self._nodes    = nodes_ref
         self._searched = False
+        self._toggle_hotspots: list[tuple[QRectF, str]] = []
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
@@ -504,6 +509,7 @@ class NodeItem(QGraphicsItem):
         n = self._node
         w, h = NODE_W, self._h
         sel = self.isSelected()
+        self._toggle_hotspots = []
 
         # 배경색
         if n.is_entry:  bg = C_NODE_ENTRY
@@ -550,10 +556,13 @@ class NodeItem(QGraphicsItem):
             y += LINE_H
             painter.setFont(FONT_ADDR)
             painter.setPen(QPen(C_TEXT_ARG))
-            for reg in ("rcx", "rdx", "r8", "r9"):
+            regs = ("arg0", "arg1", "arg2", "arg3")
+            if n.args.get("arch") != "ia32":
+                regs = ("rcx", "rdx", "r8", "r9")
+            for idx, reg in enumerate(("rcx", "rdx", "r8", "r9")):
                 val = n.args.get(reg, "")
                 if val:
-                    txt = "  {}={}".format(reg, val[:20])
+                    txt = "  {}={}".format(regs[idx], val[:20])
                     painter.drawText(x, y + LINE_H - 2, txt)
                     y += LINE_H
 
@@ -575,6 +584,8 @@ class NodeItem(QGraphicsItem):
             painter.setFont(FONT_SUB)
             painter.setPen(QPen(C_TEXT_SUB))
             state = "[펼침]" if n.expanded else "[+]"
+            self._toggle_hotspots.append(
+                (QRectF(x, y, w - PAD * 2, LINE_H), n.node_id))
             painter.drawText(x, y + LINE_H - 2,
                              "calls({}) {}".format(len(vis_ch), state))
             y += LINE_H
@@ -583,10 +594,15 @@ class NodeItem(QGraphicsItem):
             for cid in shown:
                 cn = self._nodes.get(cid)
                 if not cn: continue
+                arrow = "v" if cn.expanded else ">"
+                painter.setPen(QPen(C_TEXT_SUB))
+                painter.drawText(x + 6, y + LINE_H - 2, arrow)
+                self._toggle_hotspots.append(
+                    (QRectF(x + 2, y, w - PAD * 2 - 2, LINE_H), cid))
                 painter.setPen(QPen(C_TEXT_FUNC if cn.symbol else C_TEXT_ADDR))
                 cl = cn.label()
                 if len(cl) > 30: cl = cl[:27] + "…"
-                painter.drawText(x + 6, y + LINE_H - 2, "· " + cl)
+                painter.drawText(x + 20, y + LINE_H - 2, cl)
                 y += LINE_H
             if len(vis_ch) > 5:
                 painter.setPen(QPen(C_TEXT_SUB))
@@ -607,15 +623,34 @@ class NodeItem(QGraphicsItem):
             self.on_toggle_cb(self._node.node_id)
 
     def mousePressEvent(self, event):
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        for rect, node_id in self._toggle_hotspots:
+            if rect.contains(pos):
+                target = self._nodes.get(node_id)
+                if target:
+                    target.expanded = not target.expanded
+                    self.update()
+                    if self.on_toggle_cb:
+                        self.on_toggle_cb(target.node_id)
+                    event.accept()
+                    return
         super().mousePressEvent(event)
         if self.on_selected_cb:
             self.on_selected_cb(self._node.node_id)
 
     def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            scene = self.scene()
+            if scene and hasattr(scene, "constrain_node_position"):
+                return scene.constrain_node_position(self._node.node_id, value)
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             scene = self.scene()
             if scene and hasattr(scene, "edges_update"):
                 scene.edges_update()
+            if scene and hasattr(scene, "node_moved"):
+                if not getattr(scene, "applying_positions", False):
+                    scene.node_moved.emit(
+                        self._node.node_id, self.pos().x(), self.pos().y())
         return super().itemChange(change, value)
 
     def hoverEnterEvent(self, event):
@@ -637,6 +672,9 @@ class EdgeItem(QGraphicsPathItem):
         self._edge = edge
         self._src  = src
         self._dst  = dst
+        self._label = dst.node.label()
+        self._label_pos = QPointF()
+        self._label_rect = QRectF()
         color = {
             "call":  C_EDGE_CALL,
             "sync":  C_EDGE_SYNC,
@@ -649,15 +687,36 @@ class EdgeItem(QGraphicsPathItem):
         self.setZValue(-1)
         self.refresh()
 
+    def boundingRect(self) -> QRectF:
+        return super().boundingRect().united(self._label_rect).adjusted(-4, -4, 4, 4)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        super().paint(painter, option, widget)
+        if self._edge.kind not in ("call", "sync"):
+            return
+        painter.setFont(FONT_SUB)
+        painter.setPen(QPen(C_TEXT_SUB))
+        painter.drawText(self._label_pos, self._label)
+
     def refresh(self):
+        self.prepareGeometryChange()
         sr = self._src.boundingRect()
         dr = self._dst.boundingRect()
         sp = self._src.pos()
         dp = self._dst.pos()
 
-        # 좌→우 호출 흐름. 부모 박스 오른쪽에서 자식 박스 왼쪽으로 연결한다.
+        # 좌→우 호출 흐름. 부모의 자식 호출 순서별 고정 앵커에서 시작한다.
         sx = sp.x() + sr.width()
         sy = sp.y() + sr.height() / 2.0
+        children = [
+            cid for cid in self._src.node.children_ids
+            if cid in self._src._nodes
+        ]
+        children.sort(key=lambda cid: self._src._nodes[cid].call_seq)
+        if self._edge.dst_id in children:
+            rank = children.index(self._edge.dst_id)
+            spacing = max(12.0, (sr.height() - PAD * 2) / (len(children) + 1))
+            sy = sp.y() + PAD + spacing * (rank + 1)
         dx = dp.x()
         dy = dp.y() + dr.height() / 2.0
         mid_x = (sx + dx) / 2.0
@@ -687,6 +746,17 @@ class EdgeItem(QGraphicsPathItem):
         path.moveTo(dx, dy)
         path.lineTo(rx, ry)
 
+        label = self._dst.node.label()
+        if len(label) > 26:
+            label = label[:23] + "..."
+        self._label = label
+        fm = QFontMetrics(FONT_SUB)
+        label_w = min(180, fm.horizontalAdvance(label))
+        label_h = LINE_H
+        self._label_pos = QPointF(sx - label_w - 6, sy + 4)
+        self._label_rect = QRectF(
+            self._label_pos.x(), self._label_pos.y() - label_h + 2,
+            label_w + 4, label_h + 4)
         self.setPath(path)
 
 
@@ -696,18 +766,22 @@ class EdgeItem(QGraphicsPathItem):
 
 class GraphScene(QGraphicsScene):
     node_selected = Signal(str)  # node_id
+    node_moved = Signal(str, float, float)
 
     def __init__(self):
         super().__init__()
         self.setBackgroundBrush(QBrush(C_BG))
         self._node_items: dict[str, NodeItem] = {}
         self._edge_items: list[EdgeItem]      = []
+        self._nodes: dict[str, CallNode] = {}
+        self.applying_positions = False
 
     def rebuild(self, nodes: dict[str, CallNode],
                 edges: list[CallEdge], visible: set[str]):
         self.clear()
         self._node_items.clear()
         self._edge_items.clear()
+        self._nodes = nodes
 
         for nid in visible:
             n = nodes[nid]
@@ -726,11 +800,44 @@ class GraphScene(QGraphicsScene):
                 self._edge_items.append(ei)
 
     def apply_positions(self, positions: dict[str, tuple[float, float]]):
-        for nid, (x, y) in positions.items():
-            if nid in self._node_items:
-                self._node_items[nid].setPos(x, y)
-        self.edges_update()
-        self.update()
+        self.applying_positions = True
+        try:
+            for nid, (x, y) in positions.items():
+                if nid in self._node_items:
+                    self._node_items[nid].setPos(x, y)
+        finally:
+            self.applying_positions = False
+            self.edges_update()
+            self.update()
+
+    def constrain_node_position(self, node_id: str, value):
+        if self.applying_positions or node_id not in self._node_items:
+            return value
+        p = QPointF(value)
+        node = self._nodes.get(node_id)
+        if not node:
+            return p
+
+        col_min = 0.0
+        if node.parent_id and node.parent_id in self._node_items:
+            parent = self._node_items[node.parent_id]
+            col_min = parent.pos().x() + parent.boundingRect().width() + 40.0
+        p.setX(max(p.x(), col_min))
+
+        ordered = sorted(
+            (it.node for it in self._node_items.values()),
+            key=lambda n: n.call_seq)
+        idx = next((i for i, n in enumerate(ordered) if n.node_id == node_id), -1)
+        min_gap = 36.0
+        if idx > 0:
+            prev_item = self._node_items.get(ordered[idx - 1].node_id)
+            if prev_item:
+                p.setY(max(p.y(), prev_item.pos().y() + min_gap))
+        if 0 <= idx < len(ordered) - 1:
+            next_item = self._node_items.get(ordered[idx + 1].node_id)
+            if next_item:
+                p.setY(min(p.y(), next_item.pos().y() - min_gap))
+        return p
 
     def edges_update(self):
         for ei in self._edge_items:
@@ -874,6 +981,9 @@ class CallGraphPanel(QWidget):
         self._views:        dict[int, tuple[GraphScene, GraphView]] = {}
         self._layout_thread: Optional[QThread] = None
         self._symbol_resolver = None
+        self._manual_positions: dict[int, dict[str, tuple[float, float]]] = {}
+        self._laid_out_tids: set[int] = set()
+        self._pending_focus: dict[int, str] = {}
 
         ly = QVBoxLayout(self)
         ly.setContentsMargins(0, 0, 0, 0)
@@ -940,6 +1050,8 @@ class CallGraphPanel(QWidget):
 
         builder = CallTreeBuilder(self._symbol_resolver)
         self._session_data = builder.build(session)
+        self._manual_positions = {}
+        self._laid_out_tids = set()
         self._apply_initial_expansion()
 
         self._tabs.clear()
@@ -990,6 +1102,33 @@ class CallGraphPanel(QWidget):
                         view.focus_on(nid)
                     return
 
+    def goto_node_token(self, token: str):
+        self._on_goto(token)
+
+    def function_entries(self) -> list[dict]:
+        counts: dict[tuple[str, int], int] = {}
+        entries: list[dict] = []
+        for tid, (nodes, _) in self._session_data.items():
+            for nid, n in nodes.items():
+                if n.module.startswith("[") or n.module == "unknown":
+                    continue
+                key = (n.module.lower(), n.offset)
+                counts[key] = counts.get(key, 0) + 1
+                entries.append({
+                    "module": n.module,
+                    "offset": hex(n.offset),
+                    "tid": tid,
+                    "node_id": nid,
+                    "call_seq": n.call_seq,
+                    "trace_seq": n.trace_seq,
+                    "fallback": n.symbol,
+                    "key": key,
+                })
+        for entry in entries:
+            entry["count"] = counts.get(entry["key"], 1)
+        entries.sort(key=lambda e: (e["trace_seq"], e["tid"], e["call_seq"]))
+        return entries
+
     def set_symbol_resolver(self, resolver):
         self._symbol_resolver = resolver
 
@@ -1000,6 +1139,8 @@ class CallGraphPanel(QWidget):
         view  = GraphView(scene)
         scene.node_selected.connect(
             lambda nid, t=tid: self._on_node_signal(t, nid))
+        scene.node_moved.connect(
+            lambda nid, x, y, t=tid: self._remember_position(t, nid, x, y))
         self._views[tid] = (scene, view)
         tids   = sorted(self._session_data.keys())
         suffix = " (main)" if tid == tids[0] else ""
@@ -1037,10 +1178,28 @@ class CallGraphPanel(QWidget):
 
     def _apply(self, scene: GraphScene, view: GraphView,
                pos: dict[str, tuple[float, float]]):
+        tid = None
+        for t, (s, _) in self._views.items():
+            if s is scene:
+                tid = t
+                break
+        if tid is not None:
+            saved = self._manual_positions.get(tid, {})
+            for nid, saved_pos in saved.items():
+                if nid in pos:
+                    pos[nid] = saved_pos
         scene.apply_positions(pos)
-        view.fit_all()
+        if tid is None or tid not in self._laid_out_tids:
+            view.fit_all()
+            if tid is not None:
+                self._laid_out_tids.add(tid)
+        if tid is not None and tid in self._pending_focus:
+            view.focus_on(self._pending_focus.pop(tid))
         if self._layout_thread:
             self._layout_thread.quit()
+
+    def _remember_position(self, tid: int, node_id: str, x: float, y: float):
+        self._manual_positions.setdefault(tid, {})[node_id] = (x, y)
 
     def _visible_nodes(self, nodes: dict[str, CallNode]) -> set[str]:
         visible: set[str] = set()
@@ -1147,6 +1306,9 @@ class CallGraphPanel(QWidget):
         if "|" in node_id:
             t_s, node_id = node_id.split("|", 1)
             tid = int(t_s)
+            nodes, _ = self._session_data.get(tid, ({}, []))
+            self._expand_to(nodes, node_id)
+            self._pending_focus[tid] = node_id
             self._switch_to_tid(tid)
             self._relayout(tid)
         if tid in self._views:
@@ -1400,11 +1562,11 @@ class FridaWorker(QObject):
     def start_trace(self):
         dbg("start_trace requested: target={}".format(self._target))
         machine = read_pe_machine(self._target)
-        if machine != PE_MACHINE_AMD64:
+        if machine not in (PE_MACHINE_AMD64, PE_MACHINE_I386):
             dbg("start_trace rejected: machine={}".format(pe_machine_name(machine)))
             self.error_occurred.emit(
                 "지원하지 않는 대상 아키텍처입니다: {}. "
-                "이 도구는 Windows x64 PE만 추적합니다.".format(
+                "이 도구는 Windows x64 또는 WoW64 x86 PE를 추적합니다.".format(
                     pe_machine_name(machine)))
             self._finish()
             return
@@ -1444,8 +1606,9 @@ class FridaWorker(QObject):
             resumed = True
             dbg("frida.resume ok: pid={}".format(self._pid))
             self.status_changed.emit(
-                "트레이스 시작: {}  tids:{}".format(
-                    self._target, ",".join(str(t) for t in initial_tids)))
+                "트레이스 시작: {}  arch:{}  tids:{}".format(
+                    self._target, pe_machine_name(machine),
+                    ",".join(str(t) for t in initial_tids)))
         except Exception as e:
             dbg("start_trace exception: {!r}".format(e))
             self.error_occurred.emit("Frida: {}".format(e))
@@ -2040,7 +2203,7 @@ class LeftPanel(QWidget):
 # ============================================================
 
 class FunctionSearchPanel(QWidget):
-    function_selected = Signal(str, str)  # (module, offset_hex)
+    function_selected = Signal(str, str, str)  # (module, offset_hex, graph_token)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2081,6 +2244,10 @@ class FunctionSearchPanel(QWidget):
         self._session = session
         self._rebuild_entries()
 
+    def set_graph_entries(self, entries: list[dict]):
+        self._entries = entries
+        self._apply_filter()
+
     def refresh_names(self):
         self._rebuild_entries()
 
@@ -2099,19 +2266,31 @@ class FunctionSearchPanel(QWidget):
             if not mod or mod == "unknown":
                 continue
             key = (mod.lower(), off.lower())
-            item = seen.get(key)
-            if item is None:
-                item = {
-                    "module": mod,
-                    "offset": off,
-                    "first_seq": ev.get("seq", 0),
-                    "count": 0,
-                    "fallback": ev.get("dst_symbol", ""),
-                }
-                seen[key] = item
-            item["count"] += 1
+            seen[key] = {"count": seen.get(key, {}).get("count", 0) + 1}
 
-        self._entries = sorted(seen.values(), key=lambda e: e["first_seq"])
+        order = 0
+        for ev in self._session.events:
+            if ev.get("type") != "call":
+                continue
+            mod = ev.get("dst_module", "")
+            off = ev.get("dst_offset", "0x0")
+            if not mod or mod == "unknown":
+                continue
+            key = (mod.lower(), off.lower())
+            self._entries.append({
+                "module": mod,
+                "offset": off,
+                "tid": ev.get("thread_id", 0),
+                "node_id": "",
+                "call_seq": order,
+                "trace_seq": ev.get("seq", order),
+                "count": seen.get(key, {}).get("count", 1),
+                "fallback": ev.get("dst_symbol", ""),
+            })
+            order += 1
+
+        self._entries = sorted(
+            self._entries, key=lambda e: (e["trace_seq"], e["tid"], e["call_seq"]))
         self._apply_filter()
 
     def _label_for(self, entry: dict) -> str:
@@ -2126,7 +2305,9 @@ class FunctionSearchPanel(QWidget):
         if not label:
             label = "{}+{}".format(entry["module"], entry["offset"])
         if entry.get("count", 0) > 1:
-            label = "{} ({})".format(label, entry["count"])
+            label = "{}  total:{}".format(label, entry["count"])
+        label = "T{} #{}  {}".format(
+            entry.get("tid", "?"), entry.get("trace_seq", "?"), label)
         return label
 
     def _apply_filter(self):
@@ -2135,12 +2316,16 @@ class FunctionSearchPanel(QWidget):
         for entry in self._entries:
             label = self._label_for(entry)
             addr = "{}+{}".format(entry["module"], entry["offset"])
-            hay = "{} {}".format(label, addr).lower()
+            hay = "{} {} thread {} tid {}".format(
+                label, addr, entry.get("tid", ""), entry.get("tid", "")).lower()
             if q and q not in hay:
                 continue
             item = QTreeWidgetItem([label, addr])
+            graph_token = ""
+            if entry.get("node_id"):
+                graph_token = "{}|{}".format(entry.get("tid"), entry.get("node_id"))
             item.setData(0, Qt.ItemDataRole.UserRole,
-                         "{}|{}".format(entry["module"], entry["offset"]))
+                         "{}|{}|{}".format(entry["module"], entry["offset"], graph_token))
             self._tree.addTopLevelItem(item)
         self._tree.resizeColumnToContents(0)
 
@@ -2148,8 +2333,11 @@ class FunctionSearchPanel(QWidget):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if not data or "|" not in data:
             return
-        module, offset = str(data).split("|", 1)
-        self.function_selected.emit(module, offset)
+        parts = str(data).split("|", 2)
+        module = parts[0]
+        offset = parts[1] if len(parts) > 1 else "0x0"
+        graph_token = parts[2] if len(parts) > 2 else ""
+        self.function_selected.emit(module, offset, graph_token)
 
 
 # ============================================================
@@ -2286,15 +2474,18 @@ class MainWindow(QMainWindow):
         if self._ghidra_worker:
             self._ghidra_worker.send_sync(module, offset_hex)
 
-    def _on_function_selected(self, module: str, offset_hex: str):
-        self._graph.sync_from_ghidra(module, offset_hex)
+    def _on_function_selected(self, module: str, offset_hex: str, graph_token: str):
+        if graph_token:
+            self._graph.goto_node_token(graph_token)
+        else:
+            self._graph.sync_from_ghidra(module, offset_hex)
         self._on_graph_sync(module, offset_hex)
 
     def _on_ghidra_sync(self, module: str, offset_hex: str):
         if self._session and self._ghidra_worker:
             self._ghidra_worker.refresh_symbols_for_module(module)
             self._graph.load_session(self._session)
-            self._func_panel.refresh_names()
+            self._func_panel.set_graph_entries(self._graph.function_entries())
         self._graph.sync_from_ghidra(module, offset_hex)
 
     def _resolve_ghidra_symbol(self, module: str, offset_hex: str) -> str:
@@ -2347,8 +2538,8 @@ class MainWindow(QMainWindow):
         self._is_tracing = False
         self._left.set_tracing(False)
         self._left.update_loaded_modules(session.modules)
-        self._func_panel.set_session(session)
         self._graph.load_session(session)
+        self._func_panel.set_graph_entries(self._graph.function_entries())
         self._st("트레이스 완료  이벤트:{}  스냅샷:{}  모듈:{}".format(
             len(session.events), len(session.snapshots), len(session.modules)))
 
@@ -2367,7 +2558,7 @@ class MainWindow(QMainWindow):
             self._graph.visible_modules(), refresh=refresh, reload_graph=False)
         if reload_graph:
             self._graph.load_session(self._session)
-            self._func_panel.refresh_names()
+            self._func_panel.set_graph_entries(self._graph.function_entries())
         self._st("Ghidra 이름 갱신: {}개 모듈 반영".format(changed))
 
     def _refresh_symbol_modules(self, modules: list[str],
@@ -2381,7 +2572,7 @@ class MainWindow(QMainWindow):
                 changed += 1
         if reload_graph and self._session:
             self._graph.load_session(self._session)
-            self._func_panel.refresh_names()
+            self._func_panel.set_graph_entries(self._graph.function_entries())
         return changed
 
     def _apply_ghidra_annotations(self):
@@ -2476,8 +2667,8 @@ class MainWindow(QMainWindow):
             sess = TraceSession.from_dict(data)
             self._session = sess
             self._left.update_loaded_modules(sess.modules)
-            self._func_panel.set_session(sess)
             self._graph.load_session(sess)
+            self._func_panel.set_graph_entries(self._graph.function_entries())
             self._st("불러오기: {}  이벤트:{}".format(path, len(sess.events)))
         except Exception as e:
             QMessageBox.critical(self, "불러오기 오류", str(e))

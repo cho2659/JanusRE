@@ -1,5 +1,5 @@
 /**
- * agent.ts  –  Frida Stalker 에이전트 (Windows x64)
+ * agent.ts  –  Frida Stalker 에이전트 (Windows x64 / WoW64 x86)
  *
  * 빌드: frida-compile agent.ts -o agent.js
  *
@@ -36,6 +36,7 @@ interface StackSnapshot {
   seq:   number;
   kind:  0; // 0=enter(call 직전)
   tid:   number;
+  arch: string;
   rcx: string; rdx: string; r8: string; r9: string;
   rsp: string;
 }
@@ -151,20 +152,22 @@ function symbolName(addr: NativePointer): string {
 }
 
 /**
- * 콜스택 역추적: rsp를 읽어 리턴 어드레스 체인을 탐색.
+ * 콜스택 역추적: stack pointer를 읽어 리턴 어드레스 체인을 탐색.
  * 타겟 모듈 범위에 속하는 가장 가까운 프레임 VA 반환.
  * 찾지 못하면 "unknown".
  */
 function findTargetCaller(ctx: CpuContext): string {
+  const arch = Process.arch;
   const x64 = ctx as X64CpuContext;
-  let rsp = x64.rsp;
+  const ia32 = ctx as Ia32CpuContext;
+  let rsp = arch === "ia32" ? ia32.esp : x64.rsp;
   for (let i = 0; i < MAX_BT; i++) {
     let ra: NativePointer;
     try { ra = rsp.readPointer(); } catch (_) { break; }
     if (ra.isNull()) break;
     const mod = Process.findModuleByAddress(ra);
     if (mod && g_targets.has(mod.name.toLowerCase())) return ph(ra);
-    rsp = rsp.add(8);
+    rsp = rsp.add(Process.pointerSize);
   }
   return "unknown";
 }
@@ -172,9 +175,25 @@ function findTargetCaller(ctx: CpuContext): string {
 function captureArgs(
   ctx: CpuContext, seq: number, tid: number
 ): StackSnapshot {
+  if (Process.arch === "ia32") {
+    const x = ctx as Ia32CpuContext;
+    const arg0 = x.esp;
+    const arg1 = x.esp.add(4);
+    const arg2 = x.esp.add(8);
+    const arg3 = x.esp.add(12);
+    const readArg = (p: NativePointer): string => {
+      try { return p.readPointer().toString(); } catch (_) { return ""; }
+    };
+    return {
+      seq, kind: 0, tid, arch: "ia32",
+      rcx: readArg(arg0), rdx: readArg(arg1),
+      r8:  readArg(arg2), r9:  readArg(arg3),
+      rsp: x.esp.toString(),
+    };
+  }
   const x = ctx as X64CpuContext;
   return {
-    seq, kind: 0, tid,
+    seq, kind: 0, tid, arch: "x64",
     rcx: x.rcx.toString(), rdx: x.rdx.toString(),
     r8:  x.r8.toString(),  r9:  x.r9.toString(),
     rsp: x.rsp.toString(),
@@ -586,14 +605,20 @@ function hookUserInput(): void {
   const u32 = Process.findModuleByName("user32.dll");
   if (!u32) return;
 
-  // MSG 구조체에서 필드 읽기 (x64: hwnd[8] message[4] wParam[8] lParam[8])
+  // MSG 구조체에서 필드 읽기:
+  // x86: hwnd[4] message[4] wParam[4] lParam[4]
+  // x64: hwnd[8] message[4] padding[4] wParam[8] lParam[8]
   const readMsg = (lpMsg: NativePointer) => {
     try {
+      const ps = Process.pointerSize;
+      const msgOff = ps;
+      const wparamOff = ps === 4 ? 8 : 16;
+      const lparamOff = wparamOff + ps;
       return {
         hwnd:   ph(lpMsg.readPointer()),
-        msg_id: lpMsg.add(8).readU32(),
-        wparam: ph(lpMsg.add(12).readPointer()),
-        lparam: ph(lpMsg.add(20).readPointer()),
+        msg_id: lpMsg.add(msgOff).readU32(),
+        wparam: ph(lpMsg.add(wparamOff).readPointer()),
+        lparam: ph(lpMsg.add(lparamOff).readPointer()),
       };
     } catch (_) { return null; }
   };
@@ -766,12 +791,12 @@ rpc.exports = {
 // ══════════════════════════════════════════════════════════
 
 (function main() {
-  if (Process.arch !== "x64") {
-    throw new Error("unsupported architecture: " + Process.arch + " (x64 required)");
+  if (Process.arch !== "x64" && Process.arch !== "ia32") {
+    throw new Error("unsupported architecture: " + Process.arch + " (x64/ia32 required)");
   }
 
   Stalker.queueDrainInterval = 50;
-  send({ type: "status", text: "agent:start session=" + SESSION_ID });
+  send({ type: "status", text: "agent:start session=" + SESSION_ID + " arch=" + Process.arch });
 
   // 메인 EXE를 초기 타겟으로
   const mainMod = Process.enumerateModules()[0];

@@ -45,7 +45,7 @@ from ghidra.program.model.symbol  import (                        # type: ignore
 from ghidra.program.util          import ProgramLocation           # type: ignore
 from javax.swing                  import SwingUtilities           # type: ignore
 from ghidra.app.nav               import NavigationUtils          # type: ignore
-from ghidra.app.services          import GoToService              # type: ignore
+from ghidra.app.services          import GoToService, ProgramManager  # type: ignore
 from ghidra.util.task             import TaskMonitor              # type: ignore
 from java.lang                    import Object as JavaObject     # type: ignore
 
@@ -664,9 +664,24 @@ class BridgeClient:
                 addr    = _addr(program, offset)
                 tool = state.getTool()  # type: ignore[name-defined]
                 if tool:
+                    try:
+                        pm = tool.getService(ProgramManager)
+                        if pm:
+                            pm.openProgram(program)
+                    except Exception:
+                        pass
                     gs = tool.getService(GoToService)
                     if gs:
-                        gs.goTo(ProgramLocation(program, addr))
+                        ok = False
+                        try:
+                            ok = bool(gs.goTo(ProgramLocation(program, addr)))
+                        except Exception:
+                            ok = False
+                        if not ok:
+                            try:
+                                NavigationUtils.goTo(tool, program, addr)
+                            except Exception:
+                                pass
             finally:
                 if program: program.release(consumer)
         except Exception:
