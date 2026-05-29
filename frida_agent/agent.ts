@@ -4,7 +4,7 @@
  * 빌드: frida-compile agent.ts -o agent.js
  *
  * 설계:
- *   - CALL + RET 만 Stalker 추적 (JMP 제외)
+ *   - CALL + RET + 타겟 모듈 indirect JMP 를 Stalker 추적
  *   - 최적화/필터링보다 누락 방지를 우선한다.
  *   - Stalker call/ret 이벤트는 모듈 필터 없이 기록한다.
  *   - 타겟 모듈 export는 하나씩 Interceptor로도 기록한다.
@@ -141,6 +141,7 @@ type LastExternalCall = {
 
 const g_last_external_call_by_tid: Map<number, LastExternalCall> = new Map();
 const g_export_symbols_by_module: Map<string, Array<{ name: string; address: NativePointer }>> = new Map();
+let g_target_ranges: Array<{ base: NativePointer; end: NativePointer; name: string }> = [];
 
 // 타겟 모듈 집합 (소문자). rpc.setTargets()로 갱신.
 let g_targets: Set<string> = new Set();
@@ -204,6 +205,28 @@ function normalizedTargetName(name: string): string {
 function isTarget(mod: { name: string } | null): boolean {
   if (!mod) return false;
   return g_targets.has(normalizedTargetName(mod.name));
+}
+
+function refreshTargetRanges(): void {
+  const ranges: Array<{ base: NativePointer; end: NativePointer; name: string }> = [];
+  for (const mod of Process.enumerateModules()) {
+    if (!isTarget(mod)) continue;
+    ranges.push({
+      base: mod.base,
+      end: mod.base.add(mod.size),
+      name: mod.name,
+    });
+  }
+  g_target_ranges = ranges;
+}
+
+function isTargetAddress(addr: NativePointer): boolean {
+  for (const range of g_target_ranges) {
+    if (addr.compare(range.base) >= 0 && addr.compare(range.end) < 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function moduleOffset(addr: NativePointer, mod: Module | null): string {
@@ -354,24 +377,13 @@ function hookTargetExports(mod: Module): void {
         onEnter(_) {
           const tid = Process.getCurrentThreadId();
           const ra = (this as any).returnAddress as NativePointer;
-          const tailTarget = detectVtableTailJump(ex.address, (this as any).context);
           (this as any)._fd_tid = tid;
           (this as any)._fd_ra = ra;
-          (this as any)._fd_tail_target = tailTarget;
-          (this as any)._fd_tail_site = tailTarget ? tailJumpSite(ex.address) : null;
           recordTraceEvent("call", ra, ex.address, tid, "target_export");
-          if (tailTarget) {
-            recordTraceEvent("call", tailJumpSite(ex.address), tailTarget, tid, "target_export_tail_jump");
-          }
         },
         onLeave(_) {
           const tid = (this as any)._fd_tid || Process.getCurrentThreadId();
           const ra = (this as any)._fd_ra as NativePointer | undefined;
-          const tailTarget = (this as any)._fd_tail_target as NativePointer | null | undefined;
-          const tailSite = (this as any)._fd_tail_site as NativePointer | null | undefined;
-          if (tailTarget && tailSite) {
-            recordTraceEvent("ret", tailTarget, tailSite, tid, "target_export_tail_jump");
-          }
           if (ra) recordTraceEvent("ret", ex.address, ra, tid, "target_export");
         },
       });
@@ -390,50 +402,133 @@ function hookTargetExports(mod: Module): void {
   }
 }
 
-function tailJumpSite(entry: NativePointer): NativePointer {
-  return entry.add(6);
-}
-
-function detectVtableTailJump(entry: NativePointer, ctx: CpuContext): NativePointer | null {
-  if (Process.arch !== "x64") return null;
-
-  let disp = -1;
-  try {
-    if (entry.readU8() !== 0x48) return null;
-    if (entry.add(1).readU8() !== 0x8b) return null;
-    if (entry.add(2).readU8() !== 0x09) return null;
-    if (entry.add(3).readU8() !== 0x48) return null;
-    if (entry.add(4).readU8() !== 0x8b) return null;
-    if (entry.add(5).readU8() !== 0x01) return null;
-    if (entry.add(6).readU8() !== 0x48) return null;
-    if (entry.add(7).readU8() !== 0xff) return null;
-    if (entry.add(8).readU8() !== 0x60) return null;
-    disp = entry.add(9).readU8();
-  } catch (_) {
-    return null;
-  }
-
-  try {
-    const x64 = ctx as X64CpuContext;
-    const thisPtr = x64.rcx;
-    if (!thisPtr || thisPtr.isNull()) return null;
-    const implThis = thisPtr.readPointer();
-    if (implThis.isNull()) return null;
-    const vtable = implThis.readPointer();
-    if (vtable.isNull()) return null;
-    const target = vtable.add(disp).readPointer();
-    if (target.isNull()) return null;
-    if (!findModuleSafe(target)) return null;
-    return target;
-  } catch (_) {
-    return null;
-  }
-}
-
 function hookLoadedTargetExports(): void {
   for (const mod of Process.enumerateModules()) {
     hookTargetExports(mod);
   }
+}
+
+function parseSignedInteger(text: string): number | null {
+  const s = text.trim().toLowerCase();
+  if (!s) return null;
+  const sign = s.startsWith("-") ? -1 : 1;
+  const body = s.replace(/^[+-]/, "");
+  const value = body.startsWith("0x")
+    ? parseInt(body.slice(2), 16)
+    : parseInt(body, 10);
+  if (!Number.isFinite(value)) return null;
+  return sign * value;
+}
+
+function contextRegister(ctx: CpuContext, name: string): NativePointer | null {
+  const c = ctx as any;
+  const key = name.toLowerCase();
+  const aliases: { [key: string]: string } = {
+    eax: "eax", ebx: "ebx", ecx: "ecx", edx: "edx",
+    esi: "esi", edi: "edi", esp: "esp", ebp: "ebp", eip: "eip",
+    rax: "rax", rbx: "rbx", rcx: "rcx", rdx: "rdx",
+    rsi: "rsi", rdi: "rdi", rsp: "rsp", rbp: "rbp", rip: "rip",
+    r8: "r8", r9: "r9", r10: "r10", r11: "r11",
+    r12: "r12", r13: "r13", r14: "r14", r15: "r15",
+  };
+  const prop = aliases[key];
+  if (!prop || c[prop] === undefined || c[prop] === null) return null;
+  try {
+    return ptr(c[prop].toString());
+  } catch (_) {
+    return null;
+  }
+}
+
+function isIndirectJumpOperand(opStr: string): boolean {
+  const op = opStr.trim().toLowerCase();
+  if (!op) return false;
+  if (op.includes("[")) return true;
+  if (op.startsWith("0x")) return false;
+  return /^[a-z][a-z0-9]*$/.test(op);
+}
+
+function resolveJumpTarget(
+  opStr: string,
+  ctx: CpuContext,
+  instrAddress: NativePointer,
+  instrSize: number,
+): NativePointer | null {
+  const op = opStr.trim().toLowerCase();
+  if (!op) return null;
+
+  if (!op.includes("[") && /^[a-z][a-z0-9]*$/.test(op)) {
+    return contextRegister(ctx, op);
+  }
+
+  const m = op.match(/\[([^\]]+)\]/);
+  if (!m) return null;
+  const inner = m[1];
+  if (!inner) return null;
+
+  const expr = inner.replace(/\s+/g, "");
+  const terms = expr.match(/[+-]?[^+-]+/g) || [];
+  let base: NativePointer | null = null;
+  let disp = 0;
+
+  for (const term of terms) {
+    const clean = term.replace(/^\+/, "");
+    const reg = clean.replace(/^-/, "");
+    if (/^[a-z][a-z0-9]*$/.test(reg)) {
+      if (reg === "rip" || reg === "eip") {
+        base = instrAddress.add(instrSize);
+      } else {
+        const rv = contextRegister(ctx, reg);
+        if (rv) base = rv;
+      }
+      continue;
+    }
+    const n = parseSignedInteger(clean);
+    if (n !== null) disp += n;
+  }
+
+  if (!base) {
+    const absolute = parseSignedInteger(expr);
+    if (absolute === null) return null;
+    base = ptr(absolute);
+  }
+
+  try {
+    return base.add(disp).readPointer();
+  } catch (_) {
+    return null;
+  }
+}
+
+function symbolBase(name: string): string {
+  return (name || "").replace(/\+0x[0-9a-f]+$/i, "").toLowerCase();
+}
+
+function isFunctionBoundaryJump(src: NativePointer, dst: NativePointer): boolean {
+  const srcMod = findModuleSafe(src);
+  const dstMod = findModuleSafe(dst);
+  if (!srcMod || !dstMod) return false;
+  if (!isTarget(srcMod)) return false;
+  if (srcMod.name.toLowerCase() !== dstMod.name.toLowerCase()) return true;
+
+  const srcSym = symbolBase(symbolName(src));
+  const dstSym = symbolBase(symbolName(dst));
+  if (srcSym && dstSym) return srcSym !== dstSym;
+  if (srcSym || dstSym) return src.compare(dst) !== 0;
+  return false;
+}
+
+function recordJumpFromCallout(
+  tid: number,
+  instrAddress: NativePointer,
+  instrSize: number,
+  opStr: string,
+  ctx: CpuContext,
+): void {
+  const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize);
+  if (!target || target.isNull()) return;
+  if (!isFunctionBoundaryJump(instrAddress, target)) return;
+  recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
 }
 
 /**
@@ -576,6 +671,7 @@ function hookModules(): void {
         for (const mod of Process.enumerateModules()) {
           if (!(this as any)._before.has(mod.name.toLowerCase())) {
             recordLoad(mod.name, mod.base, mod.size);
+            refreshTargetRanges();
             hookTargetExports(mod);
           }
         }
@@ -613,6 +709,23 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
     ok = withThreadSuspended(tid, reason, () => {
       Stalker.follow(tid, {
         events: { call: true, ret: true },
+        transform(iterator: any): void {
+          let instruction: any;
+          while ((instruction = iterator.next()) !== null) {
+            const mnemonic = String(instruction.mnemonic || "").toLowerCase();
+            if (mnemonic === "jmp") {
+              const address = instruction.address as NativePointer;
+              const opStr = String(instruction.opStr || "");
+              if (isTargetAddress(address) && isIndirectJumpOperand(opStr)) {
+                const size = Number(instruction.size || 0);
+                iterator.putCallout((ctx: CpuContext) => {
+                  recordJumpFromCallout(tid, address, size, opStr, ctx);
+                });
+              }
+            }
+            iterator.keep();
+          }
+        },
 
         onReceive(evbuf: ArrayBuffer): void {
           const parsed = Stalker.parse(evbuf, {
@@ -904,6 +1017,7 @@ rpc.exports = {
     // 메인 EXE는 항상 포함
     const mainMod = Process.enumerateModules()[0];
     if (mainMod) g_targets.add(normalizedTargetName(mainMod.name));
+    refreshTargetRanges();
     hookLoadedTargetExports();
     send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
   },
@@ -925,6 +1039,7 @@ rpc.exports = {
   // 메인 EXE를 초기 타겟으로
   const mainMod = Process.enumerateModules()[0];
   if (mainMod) g_targets.add(normalizedTargetName(mainMod.name));
+  refreshTargetRanges();
 
   hookModules();
   hookThreadCreation();

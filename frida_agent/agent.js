@@ -1,5 +1,5 @@
 📦
-25467 /agent.js
+28775 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -43,6 +43,7 @@ var require_agent = __commonJS({
     var g_hooked_target_exports = /* @__PURE__ */ new Set();
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_export_symbols_by_module = /* @__PURE__ */ new Map();
+    var g_target_ranges = [];
     var g_targets = /* @__PURE__ */ new Set();
     var SESSION_ID = generateUUID();
     var MAX_BT = 24;
@@ -94,6 +95,27 @@ var require_agent = __commonJS({
       if (!mod)
         return false;
       return g_targets.has(normalizedTargetName(mod.name));
+    }
+    function refreshTargetRanges() {
+      const ranges = [];
+      for (const mod of Process.enumerateModules()) {
+        if (!isTarget(mod))
+          continue;
+        ranges.push({
+          base: mod.base,
+          end: mod.base.add(mod.size),
+          name: mod.name
+        });
+      }
+      g_target_ranges = ranges;
+    }
+    function isTargetAddress(addr) {
+      for (const range of g_target_ranges) {
+        if (addr.compare(range.base) >= 0 && addr.compare(range.end) < 0) {
+          return true;
+        }
+      }
+      return false;
     }
     function moduleOffset(addr, mod) {
       if (!mod)
@@ -237,24 +259,13 @@ var require_agent = __commonJS({
             onEnter(_) {
               const tid = Process.getCurrentThreadId();
               const ra = this.returnAddress;
-              const tailTarget = detectVtableTailJump(ex.address, this.context);
               this._fd_tid = tid;
               this._fd_ra = ra;
-              this._fd_tail_target = tailTarget;
-              this._fd_tail_site = tailTarget ? tailJumpSite(ex.address) : null;
               recordTraceEvent("call", ra, ex.address, tid, "target_export");
-              if (tailTarget) {
-                recordTraceEvent("call", tailJumpSite(ex.address), tailTarget, tid, "target_export_tail_jump");
-              }
             },
             onLeave(_) {
               const tid = this._fd_tid || Process.getCurrentThreadId();
               const ra = this._fd_ra;
-              const tailTarget = this._fd_tail_target;
-              const tailSite = this._fd_tail_site;
-              if (tailTarget && tailSite) {
-                recordTraceEvent("ret", tailTarget, tailSite, tid, "target_export_tail_jump");
-              }
               if (ra)
                 recordTraceEvent("ret", ex.address, ra, tid, "target_export");
             }
@@ -271,61 +282,145 @@ var require_agent = __commonJS({
         });
       }
     }
-    function tailJumpSite(entry) {
-      return entry.add(6);
-    }
-    function detectVtableTailJump(entry, ctx) {
-      if (Process.arch !== "x64")
-        return null;
-      let disp = -1;
-      try {
-        if (entry.readU8() !== 72)
-          return null;
-        if (entry.add(1).readU8() !== 139)
-          return null;
-        if (entry.add(2).readU8() !== 9)
-          return null;
-        if (entry.add(3).readU8() !== 72)
-          return null;
-        if (entry.add(4).readU8() !== 139)
-          return null;
-        if (entry.add(5).readU8() !== 1)
-          return null;
-        if (entry.add(6).readU8() !== 72)
-          return null;
-        if (entry.add(7).readU8() !== 255)
-          return null;
-        if (entry.add(8).readU8() !== 96)
-          return null;
-        disp = entry.add(9).readU8();
-      } catch (_) {
-        return null;
-      }
-      try {
-        const x64 = ctx;
-        const thisPtr = x64.rcx;
-        if (!thisPtr || thisPtr.isNull())
-          return null;
-        const implThis = thisPtr.readPointer();
-        if (implThis.isNull())
-          return null;
-        const vtable = implThis.readPointer();
-        if (vtable.isNull())
-          return null;
-        const target = vtable.add(disp).readPointer();
-        if (target.isNull())
-          return null;
-        if (!findModuleSafe(target))
-          return null;
-        return target;
-      } catch (_) {
-        return null;
-      }
-    }
     function hookLoadedTargetExports() {
       for (const mod of Process.enumerateModules()) {
         hookTargetExports(mod);
       }
+    }
+    function parseSignedInteger(text) {
+      const s = text.trim().toLowerCase();
+      if (!s)
+        return null;
+      const sign = s.startsWith("-") ? -1 : 1;
+      const body = s.replace(/^[+-]/, "");
+      const value = body.startsWith("0x") ? parseInt(body.slice(2), 16) : parseInt(body, 10);
+      if (!Number.isFinite(value))
+        return null;
+      return sign * value;
+    }
+    function contextRegister(ctx, name) {
+      const c = ctx;
+      const key = name.toLowerCase();
+      const aliases = {
+        eax: "eax",
+        ebx: "ebx",
+        ecx: "ecx",
+        edx: "edx",
+        esi: "esi",
+        edi: "edi",
+        esp: "esp",
+        ebp: "ebp",
+        eip: "eip",
+        rax: "rax",
+        rbx: "rbx",
+        rcx: "rcx",
+        rdx: "rdx",
+        rsi: "rsi",
+        rdi: "rdi",
+        rsp: "rsp",
+        rbp: "rbp",
+        rip: "rip",
+        r8: "r8",
+        r9: "r9",
+        r10: "r10",
+        r11: "r11",
+        r12: "r12",
+        r13: "r13",
+        r14: "r14",
+        r15: "r15"
+      };
+      const prop = aliases[key];
+      if (!prop || c[prop] === void 0 || c[prop] === null)
+        return null;
+      try {
+        return ptr(c[prop].toString());
+      } catch (_) {
+        return null;
+      }
+    }
+    function isIndirectJumpOperand(opStr) {
+      const op = opStr.trim().toLowerCase();
+      if (!op)
+        return false;
+      if (op.includes("["))
+        return true;
+      if (op.startsWith("0x"))
+        return false;
+      return /^[a-z][a-z0-9]*$/.test(op);
+    }
+    function resolveJumpTarget(opStr, ctx, instrAddress, instrSize) {
+      const op = opStr.trim().toLowerCase();
+      if (!op)
+        return null;
+      if (!op.includes("[") && /^[a-z][a-z0-9]*$/.test(op)) {
+        return contextRegister(ctx, op);
+      }
+      const m = op.match(/\[([^\]]+)\]/);
+      if (!m)
+        return null;
+      const inner = m[1];
+      if (!inner)
+        return null;
+      const expr = inner.replace(/\s+/g, "");
+      const terms = expr.match(/[+-]?[^+-]+/g) || [];
+      let base = null;
+      let disp = 0;
+      for (const term of terms) {
+        const clean = term.replace(/^\+/, "");
+        const reg = clean.replace(/^-/, "");
+        if (/^[a-z][a-z0-9]*$/.test(reg)) {
+          if (reg === "rip" || reg === "eip") {
+            base = instrAddress.add(instrSize);
+          } else {
+            const rv = contextRegister(ctx, reg);
+            if (rv)
+              base = rv;
+          }
+          continue;
+        }
+        const n = parseSignedInteger(clean);
+        if (n !== null)
+          disp += n;
+      }
+      if (!base) {
+        const absolute = parseSignedInteger(expr);
+        if (absolute === null)
+          return null;
+        base = ptr(absolute);
+      }
+      try {
+        return base.add(disp).readPointer();
+      } catch (_) {
+        return null;
+      }
+    }
+    function symbolBase(name) {
+      return (name || "").replace(/\+0x[0-9a-f]+$/i, "").toLowerCase();
+    }
+    function isFunctionBoundaryJump(src, dst) {
+      const srcMod = findModuleSafe(src);
+      const dstMod = findModuleSafe(dst);
+      if (!srcMod || !dstMod)
+        return false;
+      if (!isTarget(srcMod))
+        return false;
+      if (srcMod.name.toLowerCase() !== dstMod.name.toLowerCase())
+        return true;
+      const srcSym = symbolBase(symbolName(src));
+      const dstSym = symbolBase(symbolName(dst));
+      if (srcSym && dstSym)
+        return srcSym !== dstSym;
+      if (srcSym || dstSym)
+        return src.compare(dst) !== 0;
+      return false;
+    }
+    function recordJumpFromCallout(tid, instrAddress, instrSize, opStr, ctx) {
+      const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize);
+      if (!target || target.isNull())
+        return;
+      if (!isFunctionBoundaryJump(instrAddress, target))
+        return;
+      recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
     }
     function findTargetCaller(ctx, immediateReturn) {
       const immediateMod = findModuleSafe(immediateReturn || null);
@@ -451,6 +546,7 @@ var require_agent = __commonJS({
             for (const mod of Process.enumerateModules()) {
               if (!this._before.has(mod.name.toLowerCase())) {
                 recordLoad(mod.name, mod.base, mod.size);
+                refreshTargetRanges();
                 hookTargetExports(mod);
               }
             }
@@ -482,6 +578,23 @@ var require_agent = __commonJS({
         ok = withThreadSuspended(tid, reason, () => {
           Stalker.follow(tid, {
             events: { call: true, ret: true },
+            transform(iterator) {
+              let instruction;
+              while ((instruction = iterator.next()) !== null) {
+                const mnemonic = String(instruction.mnemonic || "").toLowerCase();
+                if (mnemonic === "jmp") {
+                  const address = instruction.address;
+                  const opStr = String(instruction.opStr || "");
+                  if (isTargetAddress(address) && isIndirectJumpOperand(opStr)) {
+                    const size = Number(instruction.size || 0);
+                    iterator.putCallout((ctx) => {
+                      recordJumpFromCallout(tid, address, size, opStr, ctx);
+                    });
+                  }
+                }
+                iterator.keep();
+              }
+            },
             onReceive(evbuf) {
               const parsed = Stalker.parse(evbuf, {
                 annotate: true,
@@ -726,6 +839,7 @@ var require_agent = __commonJS({
         const mainMod = Process.enumerateModules()[0];
         if (mainMod)
           g_targets.add(normalizedTargetName(mainMod.name));
+        refreshTargetRanges();
         hookLoadedTargetExports();
         send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
       }
@@ -740,6 +854,7 @@ var require_agent = __commonJS({
       const mainMod = Process.enumerateModules()[0];
       if (mainMod)
         g_targets.add(normalizedTargetName(mainMod.name));
+      refreshTargetRanges();
       hookModules();
       hookThreadCreation();
       hookExit();
