@@ -1,5 +1,5 @@
 📦
-25788 /agent.js
+24732 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -25,6 +25,7 @@ var require_agent = __commonJS({
     var g_mod_events = [];
     var g_sync_events = [];
     var g_spawn_events = [];
+    var g_handle_events = [];
     var g_stalked = /* @__PURE__ */ new Set();
     var g_attach_failed = /* @__PURE__ */ new Set();
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
@@ -38,6 +39,9 @@ var require_agent = __commonJS({
     var g_sent_mod_events = 0;
     var g_sent_sync_events = 0;
     var g_sent_spawn_events = 0;
+    var g_sent_handle_events = 0;
+    var g_handle_gen_by_key = /* @__PURE__ */ new Map();
+    var g_next_handle_gen = 1;
     var g_targets = /* @__PURE__ */ new Set();
     var SESSION_ID = generateUUID();
     var MAX_BT = 24;
@@ -55,6 +59,31 @@ var require_agent = __commonJS({
     }
     function nextSeq() {
       return g_seq++;
+    }
+    function ntStatus(rv) {
+      return ph(rv);
+    }
+    function handleKey(handle) {
+      if (typeof handle === "string")
+        return handle.toLowerCase();
+      return ph(handle).toLowerCase();
+    }
+    function recordHandleCreate(api, handle, status, kind) {
+      const key = handleKey(handle);
+      const gen = g_next_handle_gen++;
+      g_handle_gen_by_key.set(key, gen);
+      const ev = {
+        seq: nextSeq(),
+        tid: Process.getCurrentThreadId(),
+        action: "create",
+        api,
+        handle: ph(handle),
+        handle_gen: gen,
+        status,
+        kind
+      };
+      g_handle_events.push(ev);
+      return gen;
     }
     function isTarget(mod) {
       if (!mod)
@@ -74,7 +103,54 @@ var require_agent = __commonJS({
         return "";
       }
     }
-    function findTargetCaller(ctx) {
+    function asNativePointer(value) {
+      if (value === null || value === void 0)
+        return null;
+      try {
+        if (typeof value === "number")
+          return ptr("0x" + value.toString(16));
+        if (typeof value === "string")
+          return ptr(value);
+        const s = value.toString;
+        if (typeof s === "function")
+          return ptr(s.call(value));
+      } catch (_) {
+        return null;
+      }
+      return null;
+    }
+    function numberFromAny(value) {
+      if (value === null || value === void 0)
+        return null;
+      if (typeof value === "number")
+        return value;
+      if (typeof value === "string") {
+        const s = value.trim();
+        const n = s.startsWith("0x") || s.startsWith("-0x") ? parseInt(s, 16) : parseInt(s, 10);
+        return Number.isFinite(n) ? n : null;
+      }
+      try {
+        const s = value.toString;
+        if (typeof s === "function")
+          return numberFromAny(s.call(value));
+      } catch (_) {
+      }
+      return null;
+    }
+    function findModuleSafe(addr) {
+      if (!addr)
+        return null;
+      try {
+        return Process.findModuleByAddress(addr);
+      } catch (_) {
+        return null;
+      }
+    }
+    function findTargetCaller(ctx, immediateReturn) {
+      const immediateMod = findModuleSafe(immediateReturn || null);
+      if (immediateMod && g_targets.has(immediateMod.name.toLowerCase())) {
+        return ph(immediateReturn);
+      }
       const arch = Process.arch;
       const x64 = ctx;
       const ia32 = ctx;
@@ -88,7 +164,7 @@ var require_agent = __commonJS({
         }
         if (ra.isNull())
           break;
-        const mod = Process.findModuleByAddress(ra);
+        const mod = findModuleSafe(ra);
         if (mod && g_targets.has(mod.name.toLowerCase()))
           return ph(ra);
         rsp = rsp.add(Process.pointerSize);
@@ -96,7 +172,7 @@ var require_agent = __commonJS({
       return "unknown";
     }
     function noteExternalCall(caller, target) {
-      const targetMod = Process.findModuleByAddress(target);
+      const targetMod = findModuleSafe(target);
       g_last_external_call_by_tid.set(Process.getCurrentThreadId(), {
         caller_va: ph(caller),
         target_va: ph(target),
@@ -104,13 +180,13 @@ var require_agent = __commonJS({
         at_ms: Date.now()
       });
     }
-    function consumeRecentExternalCaller(ctx) {
+    function consumeRecentExternalCaller(ctx, immediateReturn) {
       const tid = Process.getCurrentThreadId();
       const last = g_last_external_call_by_tid.get(tid);
       if (last && Date.now() - last.at_ms <= LAST_EXTERNAL_CALL_TTL_MS) {
         return last.caller_va;
       }
-      return findTargetCaller(ctx);
+      return findTargetCaller(ctx, immediateReturn);
     }
     function directCallTarget(instr) {
       const i = instr;
@@ -119,23 +195,12 @@ var require_agent = __commonJS({
         const op = operands[0];
         const value = op.value;
         if ((op.type === "imm" || op.type === "immediate") && value !== void 0) {
-          if (typeof value === "number")
-            return ptr(value);
-          if (typeof value === "string") {
-            try {
-              return ptr(value);
-            } catch (_) {
-              return null;
-            }
-          }
-          try {
-            return value;
-          } catch (_) {
-            return null;
-          }
+          return asNativePointer(value);
         }
       }
       const opStr = String(i.opStr || "");
+      if (opStr.indexOf("[") >= 0)
+        return null;
       const m = opStr.match(/0x[0-9a-fA-F]+/);
       if (!m)
         return null;
@@ -145,15 +210,64 @@ var require_agent = __commonJS({
         return null;
       }
     }
+    function readPointerSafe(addr) {
+      if (!addr)
+        return null;
+      try {
+        const p = addr.readPointer();
+        return p.isNull() ? null : p;
+      } catch (_) {
+        return null;
+      }
+    }
+    function memoryCallTarget(instr) {
+      const i = instr;
+      const src = asNativePointer(i.address);
+      if (!src)
+        return null;
+      const operands = i.operands || [];
+      if (operands.length > 0) {
+        const op = operands[0];
+        if (op && (op.type === "mem" || op.type === "memory")) {
+          const value = op.value || op.mem || {};
+          const base = String(value.base || "").toLowerCase();
+          const disp = numberFromAny(value.disp ?? value.displacement);
+          if (Process.arch === "x64" && base === "rip" && disp !== null) {
+            const next = asNativePointer(i.next) || src.add(i.size || 0);
+            return readPointerSafe(next.add(disp));
+          }
+          if ((!base || base === "0" || base === "invalid") && disp !== null) {
+            return readPointerSafe(ptr("0x" + disp.toString(16)));
+          }
+        }
+      }
+      const opStr = String(i.opStr || "");
+      const rip = opStr.match(/\[\s*rip\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)\s*\]/i);
+      if (rip) {
+        const raw = numberFromAny(rip[2] || "");
+        if (raw !== null) {
+          const disp = rip[1] === "-" ? -raw : raw;
+          const next = asNativePointer(i.next) || src.add(i.size || 0);
+          return readPointerSafe(next.add(disp));
+        }
+      }
+      const absolute = opStr.match(/\[\s*(0x[0-9a-fA-F]+)\s*\]/i);
+      if (absolute && absolute[1])
+        return readPointerSafe(ptr(absolute[1]));
+      return null;
+    }
+    function callTarget(instr) {
+      return directCallTarget(instr) || memoryCallTarget(instr);
+    }
     function shouldTrackExternalCallsite(instr) {
-      const src = instr.address;
-      const srcMod = Process.findModuleByAddress(src);
+      const src = asNativePointer(instr.address);
+      const srcMod = findModuleSafe(src);
       if (!isTarget(srcMod))
         return null;
-      const target = directCallTarget(instr);
+      const target = callTarget(instr);
       if (!target)
         return null;
-      const dstMod = Process.findModuleByAddress(target);
+      const dstMod = findModuleSafe(target);
       if (!dstMod || isTarget(dstMod))
         return null;
       return target;
@@ -326,14 +440,14 @@ var require_agent = __commonJS({
                   continue;
                 const loc = ev[1];
                 const target = ev[2];
-                const srcMod = Process.findModuleByAddress(loc);
-                const dstMod = Process.findModuleByAddress(target);
+                const srcMod = findModuleSafe(loc);
+                const dstMod = findModuleSafe(target);
                 if (g_targets.size > 0) {
                   if (!isTarget(srcMod) && !isTarget(dstMod))
                     continue;
                 }
                 const seq = nextSeq();
-                g_events.push({
+                const out = {
                   k: ks === "call" ? 0 : 1,
                   src: ph(loc),
                   dst: ph(target),
@@ -345,7 +459,8 @@ var require_agent = __commonJS({
                   dst_module: dstMod ? dstMod.name : "unknown",
                   dst_offset: moduleOffset(target, dstMod),
                   dst_symbol: symbolName(target)
-                });
+                };
+                g_events.push(out);
               }
             },
             transform(iterator) {
@@ -423,13 +538,13 @@ var require_agent = __commonJS({
         sendTraceChunk("periodic");
         send({
           type: "status",
-          text: "trace_stats events=" + g_events.length + " snapshots=" + g_snapshots.length + " modules=" + g_mod_events.length + " sync=" + g_sync_events.length
+          text: "trace_stats events=" + g_events.length + " snapshots=" + g_snapshots.length + " modules=" + g_mod_events.length + " sync=" + g_sync_events.length + " handles=" + g_handle_events.length
         });
       }, 1e3);
     }
     function hookThreadCreation() {
       const ntdll = Process.getModuleByName("ntdll.dll");
-      const onNewThread = (handlePtr, startVa, callerVa, parentTid) => {
+      const onNewThread = (apiName, status, handlePtr, startVa, callerVa, parentTid) => {
         if (handlePtr.isNull()) {
           send({ type: "status", text: "thread_create_no_handle_ptr parent_tid=" + parentTid });
           scheduleFailureScan("thread_create_no_handle_ptr");
@@ -443,6 +558,7 @@ var require_agent = __commonJS({
         }
         const api = getThreadApi();
         const tid = api && api.getThreadId ? api.getThreadId(handle) : 0;
+        const gen = recordHandleCreate(apiName, handle, status, "thread");
         if (!tid) {
           send({ type: "status", text: "thread_create_no_tid parent_tid=" + parentTid + " start=" + startVa });
           scheduleFailureScan("thread_create_no_tid");
@@ -450,10 +566,14 @@ var require_agent = __commonJS({
         }
         g_spawn_events.push({
           seq: nextSeq(),
+          api: apiName,
           parent_tid: parentTid,
           child_tid: tid,
+          thread_handle: ph(handle),
+          handle_gen: gen,
           creator_va: callerVa,
-          start_va: startVa
+          start_va: startVa,
+          status
         });
         send({
           type: "status",
@@ -469,12 +589,12 @@ var require_agent = __commonJS({
           onEnter(args) {
             this._hp = args[0];
             this._sv = ph(args[4]);
-            this._cv = consumeRecentExternalCaller(this.context);
+            this._cv = consumeRecentExternalCaller(this.context, this.returnAddress);
             this._pt = Process.getCurrentThreadId();
           },
           onLeave(rv) {
             if (rv.toInt32() === 0)
-              onNewThread(this._hp, this._sv, this._cv, this._pt);
+              onNewThread("NtCreateThreadEx", ntStatus(rv), this._hp, this._sv, this._cv, this._pt);
           }
         });
       }
@@ -484,182 +604,12 @@ var require_agent = __commonJS({
           onEnter(args) {
             this._hp = args[0];
             this._sv = "unknown";
-            this._cv = consumeRecentExternalCaller(this.context);
+            this._cv = consumeRecentExternalCaller(this.context, this.returnAddress);
             this._pt = Process.getCurrentThreadId();
           },
           onLeave(rv) {
             if (rv.toInt32() === 0)
-              onNewThread(this._hp, this._sv, this._cv, this._pt);
-          }
-        });
-      }
-    }
-    function hookSync() {
-      const ntdll = Process.getModuleByName("ntdll.dll");
-      const defs = [
-        { fn: "NtSetEvent", kind: "set_event", handle: (a) => ph(a[0]) },
-        { fn: "NtPulseEvent", kind: "pulse_event", handle: (a) => ph(a[0]) },
-        { fn: "NtReleaseMutant", kind: "release_mutex", handle: (a) => ph(a[0]) },
-        {
-          fn: "NtWaitForSingleObject",
-          kind: "wait_single",
-          handle: (a) => ph(a[0]),
-          extra: (a, ev) => {
-            if (!a[2].isNull()) {
-              try {
-                const v = a[2].readS64();
-                ev.timeout = v.compare(0) < 0 ? Math.round(Number(v.toNumber() * -1) / 1e4) : -2;
-              } catch (_) {
-                ev.timeout = -1;
-              }
-            } else {
-              ev.timeout = -1;
-            }
-          }
-        },
-        {
-          fn: "NtWaitForMultipleObjects",
-          kind: "wait_multiple",
-          handle: (a) => ph(a[1]),
-          extra: (a, ev) => {
-            if (!a[3].isNull()) {
-              try {
-                const v = a[3].readS64();
-                ev.timeout = v.compare(0) < 0 ? Math.round(Number(v.toNumber() * -1) / 1e4) : -2;
-              } catch (_) {
-                ev.timeout = -1;
-              }
-            } else {
-              ev.timeout = -1;
-            }
-          }
-        },
-        { fn: "NtQueueApcThread", kind: "queue_apc", handle: (a) => ph(a[0]) },
-        { fn: "NtAlpcSendWaitReceivePort", kind: "alpc", handle: (a) => ph(a[0]) }
-      ];
-      for (const d of defs) {
-        const addr = ntdll.findExportByName(d.fn);
-        if (!addr)
-          continue;
-        Interceptor.attach(addr, {
-          onEnter(args) {
-            const ev = {
-              seq: nextSeq(),
-              tid: Process.getCurrentThreadId(),
-              kind: d.kind,
-              handle: d.handle(args),
-              caller_va: consumeRecentExternalCaller(this.context)
-            };
-            if (d.extra)
-              d.extra(args, ev);
-            g_sync_events.push(ev);
-          }
-        });
-      }
-    }
-    function hookUserInput() {
-      const u32 = Process.findModuleByName("user32.dll");
-      if (!u32)
-        return;
-      const readMsg = (lpMsg) => {
-        try {
-          const ps = Process.pointerSize;
-          const msgOff = ps;
-          const wparamOff = ps === 4 ? 8 : 16;
-          const lparamOff = wparamOff + ps;
-          return {
-            hwnd: ph(lpMsg.readPointer()),
-            msg_id: lpMsg.add(msgOff).readU32(),
-            wparam: ph(lpMsg.add(wparamOff).readPointer()),
-            lparam: ph(lpMsg.add(lparamOff).readPointer())
-          };
-        } catch (_) {
-          return null;
-        }
-      };
-      const getMsgAddr = u32.findExportByName("GetMessageW");
-      if (getMsgAddr) {
-        Interceptor.attach(getMsgAddr, {
-          onEnter(args) {
-            this._lp = args[0];
-            this._cv = consumeRecentExternalCaller(this.context);
-          },
-          onLeave(rv) {
-            if (rv.toInt32() <= 0)
-              return;
-            const m = readMsg(this._lp);
-            if (!m)
-              return;
-            g_sync_events.push({
-              seq: nextSeq(),
-              tid: Process.getCurrentThreadId(),
-              kind: "get_message",
-              handle: m.hwnd,
-              caller_va: this._cv,
-              msg_id: m.msg_id,
-              wparam: m.wparam,
-              lparam: m.lparam
-            });
-          }
-        });
-      }
-      const peekMsgAddr = u32.findExportByName("PeekMessageW");
-      if (peekMsgAddr) {
-        Interceptor.attach(peekMsgAddr, {
-          onEnter(args) {
-            this._lp = args[0];
-            this._cv = consumeRecentExternalCaller(this.context);
-          },
-          onLeave(rv) {
-            if (rv.toInt32() === 0)
-              return;
-            const m = readMsg(this._lp);
-            if (!m)
-              return;
-            g_sync_events.push({
-              seq: nextSeq(),
-              tid: Process.getCurrentThreadId(),
-              kind: "peek_message",
-              handle: m.hwnd,
-              caller_va: this._cv,
-              msg_id: m.msg_id,
-              wparam: m.wparam,
-              lparam: m.lparam
-            });
-          }
-        });
-      }
-      const postMsg = u32.findExportByName("PostMessageW");
-      if (postMsg) {
-        Interceptor.attach(postMsg, {
-          onEnter(args) {
-            g_sync_events.push({
-              seq: nextSeq(),
-              tid: Process.getCurrentThreadId(),
-              kind: "post_message",
-              handle: ph(args[0]),
-              caller_va: consumeRecentExternalCaller(this.context),
-              msg_id: args[1].toInt32(),
-              wparam: ph(args[2]),
-              lparam: ph(args[3])
-            });
-          }
-        });
-      }
-      const sendMsg = u32.findExportByName("SendMessageW");
-      if (sendMsg) {
-        Interceptor.attach(sendMsg, {
-          onEnter(args) {
-            g_sync_events.push({
-              seq: nextSeq(),
-              tid: Process.getCurrentThreadId(),
-              kind: "send_message",
-              handle: ph(args[0]),
-              caller_va: consumeRecentExternalCaller(this.context),
-              msg_id: args[1].toInt32(),
-              wparam: ph(args[2]),
-              lparam: ph(args[3])
-            });
+              onNewThread("NtCreateThread", ntStatus(rv), this._hp, this._sv, this._cv, this._pt);
           }
         });
       }
@@ -696,24 +646,28 @@ var require_agent = __commonJS({
       const modEvents = g_mod_events.slice(g_sent_mod_events);
       const syncEvents = g_sync_events.slice(g_sent_sync_events);
       const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
-      if (events.length === 0 && snapshots.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0) {
+      const handleEvents = g_handle_events.slice(g_sent_handle_events);
+      if (events.length === 0 && snapshots.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0) {
         return;
       }
       send({
         type: "trace_chunk",
         session_id: SESSION_ID,
         reason,
+        sent_at_ms: Date.now(),
         events,
         snapshots,
         mod_events: modEvents,
         sync_events: syncEvents,
-        spawn_events: spawnEvents
+        spawn_events: spawnEvents,
+        handle_events: handleEvents
       });
       g_sent_events = g_events.length;
       g_sent_snapshots = g_snapshots.length;
       g_sent_mod_events = g_mod_events.length;
       g_sent_sync_events = g_sync_events.length;
       g_sent_spawn_events = g_spawn_events.length;
+      g_sent_handle_events = g_handle_events.length;
     }
     function flushAndSend(reason) {
       if (g_flushed)
@@ -732,11 +686,13 @@ var require_agent = __commonJS({
         type: "trace_complete",
         session_id: SESSION_ID,
         reason,
+        sent_at_ms: Date.now(),
         events: [],
         snapshots: [],
         mod_events: [],
         sync_events: [],
-        spawn_events: []
+        spawn_events: [],
+        handle_events: []
       });
     }
     rpc.exports = {
@@ -769,8 +725,6 @@ var require_agent = __commonJS({
         g_targets.add(mainMod.name.toLowerCase());
       hookModules();
       hookThreadCreation();
-      hookSync();
-      hookUserInput();
       hookExit();
     })();
   }

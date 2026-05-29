@@ -9,9 +9,9 @@
 # Ghidra 내부 스크립트 (PyGhidra / Jython / GraalPy)
 #
 # 프로토콜:
-#   Ghidra → Server: connect, project_info, annotate_result, xref_result,
-#                    rpc_response, sync, disconnect
-#   Server → Ghidra: connect_ack, annotate, xref, rpc_request, sync, disconnect
+#   Frida → Ghidra: connect, annotate, xref, rpc_request, sync, disconnect
+#   Ghidra → Frida: connect_ack, project_info, annotate_result, xref_result,
+#                   rpc_response, sync, disconnect
 #
 # rpc_request 처리:
 #   수신 후 SwingUtilities.invokeLater()로 Ghidra EDT에 제출.
@@ -507,42 +507,65 @@ class BridgeClient:
     def __init__(self, host: str, port: int):
         self.host = host; self.port = port
         self._sock      = None
+        self._server    = None
         self._running   = False
+        self._conn_running = False
         self._project   = state.getProject()        # type: ignore[name-defined]
         self._annotator = GhidraAnnotator(self._project)
 
-    # ── 연결 ────────────────────────────────────────────────
-    def connect(self):
-        last_err = None
-        for _ in range(20):
+    # ── 서버 ────────────────────────────────────────────────
+    def serve(self):
+        self._running = True
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind((self.host, self.port))
+        self._server.listen(1)
+        self._server.settimeout(1.0)
+        print("[FridaBridge] Ghidra 서버 대기: {}:{}".format(
+            self.host, self.port))
+        try:
+            while self._running:
+                try:
+                    sock, addr = self._server.accept()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    if self._running:
+                        print("[FridaBridge] accept 오류: {}".format(e))
+                    break
+                self._handle_client(sock, addr)
+        finally:
             try:
-                self._sock = socket.create_connection(
-                    (self.host, self.port), timeout=2)
-                break
-            except Exception as e:
-                last_err = e
-                time.sleep(0.5)
-        if self._sock is None:
-            raise last_err
+                if self._server:
+                    self._server.close()
+            except Exception:
+                pass
+            self._server = None
+
+    def _handle_client(self, sock, addr):
+        self._sock = sock
+        self._sock.settimeout(5.0)
+        hello = self._recv_one()
+        if not (hello and hello.get("type") == "connect"):
+            print("[FridaBridge] 잘못된 첫 메시지: {}".format(hello))
+            self._close()
+            return
+        self._send({"type":"connect_ack","status":"ok",
+                    "message":"Registered."})
         self._sock.settimeout(None)
-        pname = self._project.getName()
-        self._send({"type":"connect","client":"ghidra",
-                    "project":pname,"version":"1.0"})
-        ack = self._recv_one()
-        if not (ack and ack.get("status") == "ok"):
-            print("[FridaBridge] 서버 응답 이상: {}".format(ack)); return
-        print("[FridaBridge] 연결 완료.")
+        print("[FridaBridge] 연결 완료: {}".format(addr))
         # project_info 즉시 전송
         files = [f.getName() for f in _all_files(self._project)]
         self._send({"type":"project_info","files":files})
         print("[FridaBridge] project_info 전송: {}".format(files))
+        self.run_loop()
 
     # ── 수신 루프 ────────────────────────────────────────────
     def run_loop(self):
-        self._running = True
+        self._conn_running = True
         buf = ""
         try:
-            while self._running:
+            while self._running and self._conn_running:
                 self._sock.settimeout(0.05)
                 try:
                     chunk = self._sock.recv(65536)
@@ -566,11 +589,18 @@ class BridgeClient:
             print("[FridaBridge] 루프 오류: {}".format(e))
             traceback.print_exc()
         finally:
-            self._running = False
+            self._conn_running = False
             self._send({"type":"disconnect","client":"ghidra"})
             self._close()
 
-    def stop(self): self._running = False
+    def stop(self):
+        self._conn_running = False
+        self._running = False
+        try:
+            if self._server:
+                self._server.close()
+        except Exception:
+            pass
 
     # ── 메시지 처리 ──────────────────────────────────────────
     def _dispatch(self, msg: dict):
@@ -612,8 +642,8 @@ class BridgeClient:
             self._ghidra_goto(module, offset_hex)
 
         elif t == "disconnect":
-            print("[FridaBridge] 서버 disconnect.")
-            self._running = False
+            print("[FridaBridge] Frida disconnect.")
+            self._conn_running = False
 
         else:
             print("[FridaBridge] 알 수 없는 타입: {}".format(t))
@@ -722,16 +752,9 @@ def run():
     print(" Ghidra Frida Bridge  {}:{}".format(SERVER_HOST, SERVER_PORT))
     print("=" * 55)
     client = BridgeClient(SERVER_HOST, SERVER_PORT)
-    try:
-        client.connect()
-    except Exception as e:
-        print("[FridaBridge] 연결 실패: {}".format(e))
-        print("  frida_bridge_server.py 실행 여부를 확인하세요.")
-        return
-
-    t = threading.Thread(target=client.run_loop, name="FridaBridge-IO", daemon=True)
+    t = threading.Thread(target=client.serve, name="FridaBridge-Server", daemon=True)
     t.start()
-    print("[FridaBridge] 백그라운드 스레드 시작 (분석 작업 계속 가능).")
+    print("[FridaBridge] 서버 스레드 시작 (분석 작업 계속 가능).")
 
 
 run()

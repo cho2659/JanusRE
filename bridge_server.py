@@ -7,7 +7,7 @@ frida_bridge_server.py + call_graph_view.py 통합 단일 파일.
   1. PySide6 GUI (왼쪽: 타겟 모듈 / 중앙: 콜 그래프 / 오른쪽: 로드 모듈)
   2. Frida 에이전트 실행 및 트레이스 수신
   3. 트레이스 후처리 (raw VA → module+offset)
-  4. Ghidra Script TCP 서버 (포트 8763)
+  4. Ghidra Script TCP 클라이언트 (포트 8763)
   5. 트레이스 저장/불러오기 (JSON)
   6. IDA Pro 스타일 콜스택 그래프 위젯 (CallGraphPanel)
 
@@ -31,7 +31,7 @@ call_graph_view.py 구조:
 렌더링 파이프라인 (프리징 없음):
   TraceSession
     → CallTreeBuilder.build()   [메인스레드, 빠름]
-    → LayoutWorker.run()        [QThread, 계산 무거움]
+    → LayoutWorker._compute()   [메인스레드, 즉시 좌표 계산]
     → GraphScene.apply()        [메인스레드, 그리기만]
 """
 
@@ -53,7 +53,7 @@ from ctypes import wintypes
 import frida
 import networkx as nx
 from PySide6.QtCore import (
-    Qt, QThread, Signal, QObject, QRectF, QPointF,
+    Qt, QThread, Signal, QObject, QRectF, QPointF, QSettings,
 )
 from PySide6.QtGui import (
     QAction,
@@ -70,7 +70,7 @@ from PySide6.QtWidgets import (
 )
 
 AGENT_JS_PATH      = Path(__file__).parent / "frida_agent" / "agent.js"
-GHIDRA_SERVER_HOST = "0.0.0.0"
+GHIDRA_SERVER_HOST = "127.0.0.1"
 GHIDRA_SERVER_PORT = 8763
 PE_MACHINE_I386    = 0x014C
 PE_MACHINE_AMD64   = 0x8664
@@ -122,6 +122,7 @@ ARROW_SZ = 7
 class CallNode:
     __slots__ = (
         "node_id", "module", "symbol", "offset",
+        "src_module", "src_symbol", "src_offset",
         "tid", "call_seq", "trace_seq", "depth",
         "args", "retval",
         "children_ids", "parent_id",
@@ -136,6 +137,9 @@ class CallNode:
         self.module         = module
         self.symbol         = symbol
         self.offset         = offset
+        self.src_module     = ""
+        self.src_symbol     = ""
+        self.src_offset     = 0
         self.tid            = tid
         self.call_seq       = call_seq
         self.trace_seq      = call_seq
@@ -155,7 +159,21 @@ class CallNode:
             self.module, hex(self.offset))
 
     def addr_str(self) -> str:
+        if self.module.startswith("["):
+            return "Thread {} · seq {}".format(self.tid, self.trace_seq)
         return "{}!{}".format(self.module, hex(self.offset))
+
+    def src_label(self) -> str:
+        if self.src_symbol:
+            return self.src_symbol
+        if self.src_module:
+            return "{}+{}".format(self.src_module, hex(self.src_offset))
+        return ""
+
+    def src_addr_str(self) -> str:
+        if not self.src_module:
+            return ""
+        return "{}!{}".format(self.src_module, hex(self.src_offset))
 
 
 class CallEdge:
@@ -277,6 +295,13 @@ class CallTreeBuilder:
 
             ev_type = ev.get("type")
             if ev_type == "call":
+                src_mod = ev.get("src_module", "unknown")
+                src_off = self._hex(ev.get("src_offset", "0x0"))
+                src_sym = self._display_symbol(
+                    src_mod, ev.get("src_offset", "0x0"))
+                if not src_sym:
+                    src_sym = ev.get("src_symbol", "")
+
                 dst_mod = ev.get("dst_module", "unknown")
                 dst_off = self._hex(ev.get("dst_offset", "0x0"))
                 dst_sym = self._display_symbol(
@@ -298,6 +323,9 @@ class CallTreeBuilder:
                     depth    = len(stack),
                 )
                 node.trace_seq = ev.get("seq", call_seq)
+                node.src_module = src_mod
+                node.src_offset = src_off
+                node.src_symbol = src_sym
                 call_seq += 1
 
                 # enter 스냅샷 (순서 기반)
@@ -345,11 +373,33 @@ class CallTreeBuilder:
         kind = ev.get("kind", "sync")
         handle = ev.get("handle", "")
         msg_id = ev.get("msg_id", None)
+        api = ev.get("api", "")
+        status = ev.get("status", "")
+        handle_gen = ev.get("handle_gen", None)
+        names = {
+            "set_event": "SetEvent 신호",
+            "pulse_event": "PulseEvent 신호",
+            "release_mutex": "Mutex 해제",
+            "wait_single": "단일 객체 대기",
+            "wait_multiple": "다중 객체 대기",
+            "queue_apc": "APC 큐 등록",
+            "alpc": "ALPC 송수신",
+            "post_message": "PostMessage",
+            "send_message": "SendMessage",
+            "get_message": "GetMessage",
+            "peek_message": "PeekMessage",
+        }
+        label = names.get(kind, kind)
+        if api:
+            label = "{} {}".format(label, api)
+        if status:
+            label = "{} status={}".format(label, status)
         if msg_id is not None:
-            return "{} msg={}".format(kind, msg_id)
+            return "{} msg={}".format(label, msg_id)
         if handle:
-            return "{} {}".format(kind, handle)
-        return kind
+            gen = " gen={}".format(handle_gen) if handle_gen else ""
+            return "{} handle={}{}".format(label, handle, gen)
+        return label
 
     def _display_symbol(self, module: str, offset_hex: str) -> str:
         if not self._symbol_resolver:
@@ -366,6 +416,10 @@ class CallTreeBuilder:
             [n for n in nodes.values() if n.parent_id is None],
             key=lambda n: n.call_seq)
         for prev, cur in zip(roots, roots[1:]):
+            cur.parent_id = prev.node_id
+            cur.depth = max(cur.depth, prev.depth + 1)
+            if cur.node_id not in prev.children_ids:
+                prev.children_ids.append(cur.node_id)
             edges.append(CallEdge(prev.node_id, cur.node_id, "flow", tid))
 
     @staticmethod
@@ -418,21 +472,15 @@ class CallTreeBuilder:
 
 
 # ============================================================
-# LayoutWorker (QThread)
+# LayoutWorker
 # ============================================================
 
-class LayoutWorker(QObject):
-    layout_done = Signal(dict)  # {node_id: (x, y)}
-
+class LayoutWorker:
     def __init__(self, nodes: dict[str, CallNode],
                  edges: list[CallEdge], visible: set[str]):
-        super().__init__()
         self._nodes   = nodes
         self._edges   = edges
         self._visible = visible
-
-    def run(self):
-        self.layout_done.emit(self._compute())
 
     def _compute(self) -> dict[str, tuple[float, float]]:
         vis = {nid: n for nid, n in self._nodes.items()
@@ -443,9 +491,20 @@ class LayoutWorker(QObject):
         positions: dict[str, tuple[float, float]] = {}
         row_h = max(self._node_h(), 260) + V_GAP
         col_w = NODE_W + H_GAP
+        col_cache: dict[str, int] = {}
+
+        def visible_depth(node: CallNode) -> int:
+            if node.node_id in col_cache:
+                return col_cache[node.node_id]
+            if node.parent_id and node.parent_id in vis:
+                d = visible_depth(vis[node.parent_id]) + 1
+            else:
+                d = 0
+            col_cache[node.node_id] = d
+            return d
 
         for idx, n in enumerate(sorted(vis.values(), key=lambda x: x.call_seq)):
-            positions[n.node_id] = (n.depth * col_w, idx * row_h)
+            positions[n.node_id] = (visible_depth(n) * col_w, idx * row_h)
 
         return positions
 
@@ -464,6 +523,7 @@ class NodeItem(QGraphicsItem):
 
     # 노드 클릭 시 씬으로 알리기 위한 콜백 (씬에서 주입)
     on_selected_cb = None   # callable(node_id)
+    on_activated_cb = None  # callable(node_id)
     on_toggle_cb   = None   # callable(node_id)
 
     def __init__(self, node: CallNode, nodes_ref: dict[str, CallNode]):
@@ -472,9 +532,7 @@ class NodeItem(QGraphicsItem):
         self._nodes    = nodes_ref
         self._searched = False
         self._toggle_hotspots: list[tuple[QRectF, str]] = []
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setAcceptHoverEvents(True)
         self._h = self._calc_height()
 
@@ -587,7 +645,7 @@ class NodeItem(QGraphicsItem):
             self._toggle_hotspots.append(
                 (QRectF(x, y, w - PAD * 2, LINE_H), n.node_id))
             painter.drawText(x, y + LINE_H - 2,
-                             "calls({}) {}".format(len(vis_ch), state))
+                             "하위/다음({}) {}".format(len(vis_ch), state))
             y += LINE_H
             shown = vis_ch[:5]
             painter.setFont(FONT_ADDR)
@@ -617,10 +675,11 @@ class NodeItem(QGraphicsItem):
                              "→ Thread {}".format(n.spawn_tid))
 
     def mouseDoubleClickEvent(self, event):
-        self._node.expanded = not self._node.expanded
-        self.update()
-        if self.on_toggle_cb:
-            self.on_toggle_cb(self._node.node_id)
+        if self.on_activated_cb:
+            self.on_activated_cb(self._node.node_id)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
         pos = event.position() if hasattr(event, "position") else event.pos()
@@ -628,6 +687,8 @@ class NodeItem(QGraphicsItem):
             if rect.contains(pos):
                 target = self._nodes.get(node_id)
                 if target:
+                    if node_id != self._node.node_id:
+                        self._node.expanded = True
                     target.expanded = not target.expanded
                     self.update()
                     if self.on_toggle_cb:
@@ -639,18 +700,10 @@ class NodeItem(QGraphicsItem):
             self.on_selected_cb(self._node.node_id)
 
     def itemChange(self, change, value):
-        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
-            scene = self.scene()
-            if scene and hasattr(scene, "constrain_node_position"):
-                return scene.constrain_node_position(self._node.node_id, value)
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             scene = self.scene()
             if scene and hasattr(scene, "edges_update"):
                 scene.edges_update()
-            if scene and hasattr(scene, "node_moved"):
-                if not getattr(scene, "applying_positions", False):
-                    scene.node_moved.emit(
-                        self._node.node_id, self.pos().x(), self.pos().y())
         return super().itemChange(change, value)
 
     def hoverEnterEvent(self, event):
@@ -766,7 +819,6 @@ class EdgeItem(QGraphicsPathItem):
 
 class GraphScene(QGraphicsScene):
     node_selected = Signal(str)  # node_id
-    node_moved = Signal(str, float, float)
 
     def __init__(self):
         super().__init__()
@@ -787,6 +839,7 @@ class GraphScene(QGraphicsScene):
             n = nodes[nid]
             item = NodeItem(n, nodes)
             item.on_selected_cb = self.node_selected.emit
+            item.on_activated_cb = lambda nid_: self.node_selected.emit("__activate__:" + nid_)
             item.on_toggle_cb   = lambda nid_: self.node_selected.emit("__toggle__:" + nid_)
             self.addItem(item)
             self._node_items[nid] = item
@@ -810,35 +863,6 @@ class GraphScene(QGraphicsScene):
             self.edges_update()
             self.update()
 
-    def constrain_node_position(self, node_id: str, value):
-        if self.applying_positions or node_id not in self._node_items:
-            return value
-        p = QPointF(value)
-        node = self._nodes.get(node_id)
-        if not node:
-            return p
-
-        col_min = 0.0
-        if node.parent_id and node.parent_id in self._node_items:
-            parent = self._node_items[node.parent_id]
-            col_min = parent.pos().x() + parent.boundingRect().width() + 40.0
-        p.setX(max(p.x(), col_min))
-
-        ordered = sorted(
-            (it.node for it in self._node_items.values()),
-            key=lambda n: n.call_seq)
-        idx = next((i for i, n in enumerate(ordered) if n.node_id == node_id), -1)
-        min_gap = 36.0
-        if idx > 0:
-            prev_item = self._node_items.get(ordered[idx - 1].node_id)
-            if prev_item:
-                p.setY(max(p.y(), prev_item.pos().y() + min_gap))
-        if 0 <= idx < len(ordered) - 1:
-            next_item = self._node_items.get(ordered[idx + 1].node_id)
-            if next_item:
-                p.setY(min(p.y(), next_item.pos().y() - min_gap))
-        return p
-
     def edges_update(self):
         for ei in self._edge_items:
             ei.refresh()
@@ -855,7 +879,6 @@ class GraphScene(QGraphicsScene):
         if item:
             self.clearSelection()
             item.setSelected(True)
-            self.node_selected.emit(node_id)
         return item
 
 
@@ -868,18 +891,50 @@ class GraphView(QGraphicsView):
     def __init__(self, scene: GraphScene):
         super().__init__(scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(
             QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(
             QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setBackgroundBrush(QBrush(C_BG))
         self._zoom = 1.0
+        self._panning = False
+        self._pan_start = QPointF()
+        self._pan_h = 0
+        self._pan_v = 0
 
     def wheelEvent(self, event: QWheelEvent):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self._zoom = max(0.1, min(self._zoom * factor, 8.0))
         self.setTransform(self.transform().scale(factor, factor))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._pan_start = event.position()
+            self._pan_h = self.horizontalScrollBar().value()
+            self._pan_v = self.verticalScrollBar().value()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            delta = event.position() - self._pan_start
+            self.horizontalScrollBar().setValue(self._pan_h - int(delta.x()))
+            self.verticalScrollBar().setValue(self._pan_v - int(delta.y()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton and self._panning:
+            self._panning = False
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def fit_all(self):
         br = self.scene().itemsBoundingRect()
@@ -979,10 +1034,9 @@ class CallGraphPanel(QWidget):
         self._session_data: dict[int, tuple[dict, list]] = {}
         self._current_tid:  Optional[int] = None
         self._views:        dict[int, tuple[GraphScene, GraphView]] = {}
-        self._layout_thread: Optional[QThread] = None
         self._symbol_resolver = None
-        self._manual_positions: dict[int, dict[str, tuple[float, float]]] = {}
-        self._laid_out_tids: set[int] = set()
+        self._rendered_tids: set[int] = set()
+        self._fit_pending_tids: set[int] = set()
         self._pending_focus: dict[int, str] = {}
 
         ly = QVBoxLayout(self)
@@ -1035,7 +1089,7 @@ class CallGraphPanel(QWidget):
         # 플레이스홀더
         self._placeholder = QLabel(
             "트레이스 완료 후 그래프가 표시됩니다.\n"
-            "더블클릭: 펼치기/접기  |  휠: 줌  |  드래그: 이동")
+            "클릭: 펼치기/접기  |  더블클릭: Ghidra 이동  |  가운데 버튼: 이동")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet("color:#9CA3AF;font-size:13px;")
         ly.addWidget(self._placeholder)
@@ -1050,8 +1104,8 @@ class CallGraphPanel(QWidget):
 
         builder = CallTreeBuilder(self._symbol_resolver)
         self._session_data = builder.build(session)
-        self._manual_positions = {}
-        self._laid_out_tids = set()
+        self._rendered_tids = set()
+        self._fit_pending_tids = set()
         self._apply_initial_expansion()
 
         self._tabs.clear()
@@ -1066,18 +1120,9 @@ class CallGraphPanel(QWidget):
             self._relayout(main_tid)
 
     def _apply_initial_expansion(self):
-        tids = sorted(self._session_data.keys())
-        if not tids:
-            return
-        main_tid = tids[0]
-        for tid, (nodes, _) in self._session_data.items():
+        for _tid, (nodes, _) in self._session_data.items():
             for n in nodes.values():
                 n.expanded = False
-
-            terminal = self._terminal_node(nodes)
-            if tid == main_tid or (terminal and terminal.is_exit):
-                if terminal:
-                    self._expand_to(nodes, terminal.node_id)
 
     def _terminal_node(self, nodes: dict[str, CallNode]) -> Optional[CallNode]:
         if not nodes:
@@ -1106,28 +1151,41 @@ class CallGraphPanel(QWidget):
         self._on_goto(token)
 
     def function_entries(self) -> list[dict]:
-        counts: dict[tuple[str, int], int] = {}
+        counts: dict[tuple[str, str], int] = {}
         entries: list[dict] = []
         for tid, (nodes, _) in self._session_data.items():
             for nid, n in nodes.items():
                 if n.module.startswith("[") or n.module == "unknown":
                     continue
-                key = (n.module.lower(), n.offset)
+                key = self._count_key(n)
                 counts[key] = counts.get(key, 0) + 1
                 entries.append({
                     "module": n.module,
                     "offset": hex(n.offset),
+                    "src_module": n.src_module,
+                    "src_offset": hex(n.src_offset),
+                    "src_label": n.src_label(),
                     "tid": tid,
                     "node_id": nid,
                     "call_seq": n.call_seq,
                     "trace_seq": n.trace_seq,
                     "fallback": n.symbol,
-                    "key": key,
+                    "key": self._count_key(n),
                 })
         for entry in entries:
             entry["count"] = counts.get(entry["key"], 1)
         entries.sort(key=lambda e: (e["trace_seq"], e["tid"], e["call_seq"]))
         return entries
+
+    def _count_key(self, node: CallNode) -> tuple[str, str]:
+        label = node.symbol or ""
+        if "+" in label:
+            base, delta = label.rsplit("+", 1)
+            if delta.lower().startswith("0x"):
+                label = base
+        if not label:
+            label = hex(node.offset)
+        return (node.module.lower(), label.lower())
 
     def set_symbol_resolver(self, resolver):
         self._symbol_resolver = resolver
@@ -1139,8 +1197,6 @@ class CallGraphPanel(QWidget):
         view  = GraphView(scene)
         scene.node_selected.connect(
             lambda nid, t=tid: self._on_node_signal(t, nid))
-        scene.node_moved.connect(
-            lambda nid, x, y, t=tid: self._remember_position(t, nid, x, y))
         self._views[tid] = (scene, view)
         tids   = sorted(self._session_data.keys())
         suffix = " (main)" if tid == tids[0] else ""
@@ -1153,7 +1209,7 @@ class CallGraphPanel(QWidget):
 
     # ── 레이아웃 ────────────────────────────────────────────
 
-    def _relayout(self, tid: int):
+    def _relayout(self, tid: int, fit: bool = True):
         if tid not in self._session_data or tid not in self._views:
             return
         nodes, edges = self._session_data[tid]
@@ -1161,45 +1217,21 @@ class CallGraphPanel(QWidget):
 
         visible = self._visible_nodes(nodes)
         scene.rebuild(nodes, edges, visible)
+        if fit:
+            self._fit_pending_tids.add(tid)
 
-        # 워커 스레드
-        if self._layout_thread and self._layout_thread.isRunning():
-            self._layout_thread.quit()
-            self._layout_thread.wait()
+        positions = LayoutWorker(nodes, edges, visible)._compute()
+        self._apply_layout(tid, scene, view, positions)
 
-        worker = LayoutWorker(nodes, edges, visible)
-        thread = QThread()
-        worker.moveToThread(thread)
-        worker.layout_done.connect(
-            lambda pos, s=scene, v=view: self._apply(s, v, pos))
-        thread.started.connect(worker.run)
-        self._layout_thread = thread
-        thread.start()
-
-    def _apply(self, scene: GraphScene, view: GraphView,
-               pos: dict[str, tuple[float, float]]):
-        tid = None
-        for t, (s, _) in self._views.items():
-            if s is scene:
-                tid = t
-                break
-        if tid is not None:
-            saved = self._manual_positions.get(tid, {})
-            for nid, saved_pos in saved.items():
-                if nid in pos:
-                    pos[nid] = saved_pos
+    def _apply_layout(self, tid: int, scene: GraphScene, view: GraphView,
+                      pos: dict[str, tuple[float, float]]):
+        self._rendered_tids.add(tid)
         scene.apply_positions(pos)
-        if tid is None or tid not in self._laid_out_tids:
+        if tid in self._fit_pending_tids:
             view.fit_all()
-            if tid is not None:
-                self._laid_out_tids.add(tid)
-        if tid is not None and tid in self._pending_focus:
+            self._fit_pending_tids.discard(tid)
+        if tid in self._pending_focus:
             view.focus_on(self._pending_focus.pop(tid))
-        if self._layout_thread:
-            self._layout_thread.quit()
-
-    def _remember_position(self, tid: int, node_id: str, x: float, y: float):
-        self._manual_positions.setdefault(tid, {})[node_id] = (x, y)
 
     def _visible_nodes(self, nodes: dict[str, CallNode]) -> set[str]:
         visible: set[str] = set()
@@ -1227,7 +1259,8 @@ class CallGraphPanel(QWidget):
         tids = sorted(self._session_data.keys())
         if idx < len(tids):
             self._current_tid = tids[idx]
-            self._relayout(self._current_tid)
+            if self._current_tid not in self._rendered_tids:
+                self._relayout(self._current_tid)
 
     def _on_node_signal(self, tid: int, signal: str):
         """씬에서 오는 node_selected 시그널 처리."""
@@ -1239,12 +1272,14 @@ class CallGraphPanel(QWidget):
             if mods:
                 self.symbol_modules_requested.emit(mods)
             self._relayout(tid)
-        else:
-            # 선택 → Ghidra sync
+        elif signal.startswith("__activate__:"):
+            node_id = signal[len("__activate__:"):]
             nodes, _ = self._session_data.get(tid, ({}, []))
-            n = nodes.get(signal)
+            n = nodes.get(node_id)
             if n and not n.module.startswith("["):
                 self.sync_requested.emit(n.module, hex(n.offset))
+        else:
+            return
 
     def visible_modules(self) -> list[str]:
         mods: set[str] = set()
@@ -1475,6 +1510,7 @@ class TraceSession:
         self.mod_events:   list[dict] = []
         self.sync_events:  list[dict] = []
         self.spawn_events: list[dict] = []
+        self.handle_events: list[dict] = []
         self.modules:      list[str]  = []
         self.reason = ""
         self.saved  = False
@@ -1500,6 +1536,7 @@ class TraceSession:
             "mod_events":   self.mod_events,
             "sync_events":  self.sync_events,
             "spawn_events": self.spawn_events,
+            "handle_events": self.handle_events,
             "modules":      self.modules,
             "reason":       self.reason,
         }
@@ -1515,6 +1552,7 @@ class TraceSession:
         s.mod_events   = d.get("mod_events", [])
         s.sync_events  = d.get("sync_events", [])
         s.spawn_events = d.get("spawn_events", [])
+        s.handle_events = d.get("handle_events", [])
         s.modules      = d.get("modules", [])
         s.reason       = d.get("reason", "loaded")
         s.saved        = True
@@ -1550,6 +1588,7 @@ class FridaWorker(QObject):
         self._stopping      = False
         self._finished      = False
         self._detached      = False
+        self._resumed       = False
         self._trace_done_event = threading.Event()
         self._chunk_lock    = threading.Lock()
         self._chunk_events: list[dict] = []
@@ -1557,6 +1596,7 @@ class FridaWorker(QObject):
         self._chunk_mod_events: list[dict] = []
         self._chunk_sync_events: list[dict] = []
         self._chunk_spawn_events: list[dict] = []
+        self._chunk_handle_events: list[dict] = []
         self._session_id: Optional[str] = None
 
     def start_trace(self):
@@ -1604,6 +1644,7 @@ class FridaWorker(QObject):
             dbg("frida.resume begin: pid={}".format(self._pid))
             frida.resume(self._pid)
             resumed = True
+            self._resumed = True
             dbg("frida.resume ok: pid={}".format(self._pid))
             self.status_changed.emit(
                 "트레이스 시작: {}  arch:{}  tids:{}".format(
@@ -1650,7 +1691,7 @@ class FridaWorker(QObject):
             done.wait(timeout=1.5)
             if not done.is_set():
                 dbg("stop_trace rpc timeout")
-                self.status_changed.emit("stop RPC 지연 - 대상 프로세스 kill")
+                self.status_changed.emit("stop RPC 지연 - 계측만 분리")
             elif errors and not self._done:
                 self.status_changed.emit("stop: {}".format(errors[0]))
             else:
@@ -1660,7 +1701,6 @@ class FridaWorker(QObject):
                 else:
                     dbg("trace_complete wait timeout after stop rpc")
 
-        self._kill_spawned()
         if not self._done:
             self._cleanup()
             self._finish()
@@ -1673,7 +1713,12 @@ class FridaWorker(QObject):
                 self.status_changed.emit("Frida: {}".format(msg))
             else:
                 self.error_occurred.emit(msg)
-                self._kill_spawned()
+                if self._resumed:
+                    self.status_changed.emit(
+                        "Frida 오류 - 대상 프로세스는 계속 실행 중")
+                    self._pid = None
+                else:
+                    self._kill_spawned()
                 self._cleanup()
                 self._finish()
             return
@@ -1723,16 +1768,27 @@ class FridaWorker(QObject):
     def _append_trace_payload(self, pl: dict):
         with self._chunk_lock:
             self._session_id = pl.get("session_id", self._session_id)
+            sent_at_ms = pl.get("sent_at_ms")
+            if sent_at_ms is None:
+                sent_at_ms = int(time.time() * 1000)
+            for key in (
+                "events", "snapshots", "mod_events", "sync_events",
+                "spawn_events", "handle_events"):
+                for ev in pl.get(key, []):
+                    if isinstance(ev, dict) and "sent_at_ms" not in ev:
+                        ev["sent_at_ms"] = sent_at_ms
             self._chunk_events.extend(pl.get("events", []))
             self._chunk_snapshots.extend(pl.get("snapshots", []))
             self._chunk_mod_events.extend(pl.get("mod_events", []))
             self._chunk_sync_events.extend(pl.get("sync_events", []))
             self._chunk_spawn_events.extend(pl.get("spawn_events", []))
-            dbg("chunk cache totals raw:{} mod:{} sync:{} spawn:{}".format(
+            self._chunk_handle_events.extend(pl.get("handle_events", []))
+            dbg("chunk cache totals raw:{} mod:{} sync:{} spawn:{} handle:{}".format(
                 len(self._chunk_events),
                 len(self._chunk_mod_events),
                 len(self._chunk_sync_events),
-                len(self._chunk_spawn_events)))
+                len(self._chunk_spawn_events),
+                len(self._chunk_handle_events)))
 
     def _build_session(self, reason: str) -> TraceSession:
         with self._chunk_lock:
@@ -1741,6 +1797,7 @@ class FridaWorker(QObject):
             mods = list(self._chunk_mod_events)
             sync_events = list(self._chunk_sync_events)
             spawn_events = list(self._chunk_spawn_events)
+            handle_events = list(self._chunk_handle_events)
             session_id = self._session_id
 
         evs = postprocess(raw, mods)
@@ -1755,6 +1812,7 @@ class FridaWorker(QObject):
         sess.mod_events = mods
         sess.sync_events = sync_events
         sess.spawn_events = spawn_events
+        sess.handle_events = handle_events
         sess.modules = names
         sess.reason = reason
         sess.build_graph()
@@ -1799,7 +1857,7 @@ class FridaWorker(QObject):
 
 
 # ============================================================
-# Ghidra Script TCP 서버
+# Ghidra Script TCP 클라이언트
 # ============================================================
 
 class GhidraServerWorker(QObject):
@@ -1814,6 +1872,7 @@ class GhidraServerWorker(QObject):
         self._lock     = threading.Lock()
         self._pending: Optional[TraceSession]  = None
         self._running  = False
+        self._connect_enabled = True
         self._project_files: set[str] = set()
         self._symbol_cache: dict[str, list[dict]] = {}
 
@@ -1823,39 +1882,39 @@ class GhidraServerWorker(QObject):
 
     def run_server(self):
         self._running = True
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((GHIDRA_SERVER_HOST, GHIDRA_SERVER_PORT))
-        srv.listen(5)
-        srv.settimeout(1.0)
         self.status_changed.emit(
-            "Ghidra 서버 대기: {}:{}".format(GHIDRA_SERVER_HOST, GHIDRA_SERVER_PORT))
+            "Ghidra 연결 대기: {}:{}".format(GHIDRA_SERVER_HOST, GHIDRA_SERVER_PORT))
         while self._running:
-            try:
-                conn, addr = srv.accept()
-            except socket.timeout:
+            if not self._connect_enabled:
+                time.sleep(0.2)
                 continue
+            try:
+                conn = socket.create_connection(
+                    (GHIDRA_SERVER_HOST, GHIDRA_SERVER_PORT), timeout=2.0)
             except Exception:
-                break
-            threading.Thread(
-                target=self._handle, args=(conn, addr), daemon=True).start()
-        srv.close()
+                if self._running:
+                    time.sleep(0.5)
+                continue
+            self._handle(conn, (GHIDRA_SERVER_HOST, GHIDRA_SERVER_PORT))
+            if self._running:
+                time.sleep(0.5)
 
     def _handle(self, conn: socket.socket, addr):
         buf = ""
         try:
-            # 첫 메시지: connect
+            conn.settimeout(5.0)
+            self._send(conn, {"type": "connect", "client": "frida",
+                              "version": "1.0"})
             while "\n" not in buf:
                 c = conn.recv(4096)
                 if not c: return
                 buf += c.decode("utf-8", errors="replace")
             line, buf = buf.split("\n", 1)
             msg = json.loads(line.strip())
-            if not (msg.get("type") == "connect" and msg.get("client") == "ghidra"):
+            if not (msg.get("type") == "connect_ack"
+                    and msg.get("status") == "ok"):
                 return
 
-            self._send(conn, {"type": "connect_ack", "status": "ok",
-                               "message": "Registered."})
             with self._lock: self._conn = conn
             self.ghidra_connected.emit(True)
             self.status_changed.emit("Ghidra 연결: {}".format(addr))
@@ -1901,7 +1960,7 @@ class GhidraServerWorker(QObject):
         except Exception as e:
             self.status_changed.emit("Ghidra 오류: {}".format(e))
         finally:
-            try: self._send(conn, {"type": "disconnect", "client": "server"})
+            try: self._send(conn, {"type": "disconnect", "client": "frida"})
             except: pass
             try: conn.close()
             except: pass
@@ -2081,8 +2140,27 @@ class GhidraServerWorker(QObject):
         self._running = False
         with self._lock: conn = self._conn
         if conn:
-            try: self._send(conn, {"type": "disconnect", "client": "server"})
+            try: self._send(conn, {"type": "disconnect", "client": "frida"})
             except: pass
+            try: conn.close()
+            except: pass
+
+    def disconnect_ghidra(self, pause: bool = False):
+        if pause:
+            self._connect_enabled = False
+        with self._lock: conn = self._conn
+        if conn:
+            try: self._send(conn, {"type": "disconnect", "client": "frida"})
+            except: pass
+            try: conn.close()
+            except: pass
+        if pause:
+            self.status_changed.emit("Ghidra 연결 대기 해제")
+
+    def resume_ghidra(self):
+        self._connect_enabled = True
+        self.status_changed.emit(
+            "Ghidra 연결 대기: {}:{}".format(GHIDRA_SERVER_HOST, GHIDRA_SERVER_PORT))
 
     @staticmethod
     def _send(conn: socket.socket, obj: dict):
@@ -2117,6 +2195,7 @@ class LeftPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._path_cache: dict[str, str] = {}
+        self._settings = QSettings("frida_delta", "frida_delta")
         ly = QVBoxLayout(self)
         ly.setContentsMargins(4, 4, 4, 4)
 
@@ -2146,8 +2225,9 @@ class LeftPanel(QWidget):
         self._stop_btn = QPushButton("■  트레이스 강제 종료")
         self._stop_btn.setEnabled(False)
         self._stop_btn.setStyleSheet(
-            "background:#DC2626;color:white;"
-            "border:none;border-radius:3px;padding:5px;")
+            "QPushButton{background:#DC2626;color:white;"
+            "border:none;border-radius:3px;padding:5px;}"
+            "QPushButton:disabled{background:#CBD5E1;color:#64748B;}")
         self._stop_btn.clicked.connect(self.stop_trace_requested)
         ly.addWidget(self._stop_btn)
 
@@ -2181,21 +2261,52 @@ class LeftPanel(QWidget):
         menu.exec(self._list.mapToGlobal(pos))
 
     def _request(self, fname: str):
-        if fname in self._path_cache:
-            self.start_trace_requested.emit(self._path_cache[fname])
+        cached = self._cached_path(fname)
+        if cached:
+            path = self._select_target_path(fname, cached)
+            if path:
+                self._remember_path(fname, path)
+                self.start_trace_requested.emit(path)
             return
         for d in [Path.cwd(), Path(__file__).parent]:
             p = d / fname
             if p.exists():
-                self._path_cache[fname] = str(p)
+                self._remember_path(fname, str(p))
                 self.start_trace_requested.emit(str(p))
                 return
+        path = self._select_target_path(fname, "")
+        if path:
+            self._remember_path(fname, path)
+            self.start_trace_requested.emit(path)
+
+    def _select_target_path(self, fname: str, initial: str) -> str:
+        if initial and not Path(initial).exists():
+            parent = Path(initial).parent
+            initial = str(parent) if parent.exists() else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "'{}' 위치 지정".format(fname), "",
+            self, "'{}' 위치 지정".format(fname), initial,
             "{} ({});;모든 파일 (*)".format(fname, fname))
+        return path
+
+    def _cached_path(self, fname: str) -> str:
+        path = self._path_cache.get(fname)
+        if path:
+            return path
+        value = self._settings.value(self._settings_key(fname), "")
+        path = str(value) if value else ""
         if path:
             self._path_cache[fname] = path
-            self.start_trace_requested.emit(path)
+        return path
+
+    def _remember_path(self, fname: str, path: str):
+        self._path_cache[fname] = path
+        self._settings.setValue(self._settings_key(fname), path)
+        self._settings.sync()
+
+    @staticmethod
+    def _settings_key(fname: str) -> str:
+        return "target_paths/{}".format(
+            fname.replace("\\", "_").replace("/", "_"))
 
 
 # ============================================================
@@ -2226,7 +2337,7 @@ class FunctionSearchPanel(QWidget):
         ly.addWidget(self._edit)
 
         self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["함수", "위치"])
+        self._tree.setHeaderLabels(["함수", "출발지", "도착지"])
         self._tree.setRootIsDecorated(False)
         self._tree.itemActivated.connect(self._activate)
         self._tree.itemDoubleClicked.connect(self._activate)
@@ -2294,6 +2405,14 @@ class FunctionSearchPanel(QWidget):
         self._apply_filter()
 
     def _label_for(self, entry: dict) -> str:
+        label = self._base_label_for(entry)
+        if entry.get("count", 0) > 1:
+            label = "{}  total:{}".format(label, entry["count"])
+        label = "T{} #{}  {}".format(
+            entry.get("tid", "?"), entry.get("trace_seq", "?"), label)
+        return label
+
+    def _base_label_for(self, entry: dict) -> str:
         sym = ""
         if self._symbol_resolver:
             try:
@@ -2304,10 +2423,6 @@ class FunctionSearchPanel(QWidget):
         label = sym or entry.get("fallback", "")
         if not label:
             label = "{}+{}".format(entry["module"], entry["offset"])
-        if entry.get("count", 0) > 1:
-            label = "{}  total:{}".format(label, entry["count"])
-        label = "T{} #{}  {}".format(
-            entry.get("tid", "?"), entry.get("trace_seq", "?"), label)
         return label
 
     def _apply_filter(self):
@@ -2315,12 +2430,20 @@ class FunctionSearchPanel(QWidget):
         self._tree.clear()
         for entry in self._entries:
             label = self._label_for(entry)
-            addr = "{}+{}".format(entry["module"], entry["offset"])
-            hay = "{} {} thread {} tid {}".format(
-                label, addr, entry.get("tid", ""), entry.get("tid", "")).lower()
+            src_label = entry.get("src_label", "") or "{}+{}".format(
+                entry.get("src_module", ""), entry.get("src_offset", ""))
+            src_addr = "{}+{}".format(
+                entry.get("src_module", ""), entry.get("src_offset", ""))
+            dst_addr = "{}+{}".format(entry["module"], entry["offset"])
+            src_text = "{} ({})".format(src_label, src_addr) if src_label else src_addr
+            dst_base = self._base_label_for(entry)
+            dst_text = "{} ({})".format(dst_base, dst_addr)
+            hay = "{} {} {} {} thread {} tid {}".format(
+                label, src_text, src_addr, dst_text,
+                entry.get("tid", ""), entry.get("tid", "")).lower()
             if q and q not in hay:
                 continue
-            item = QTreeWidgetItem([label, addr])
+            item = QTreeWidgetItem([label, src_text, dst_text])
             graph_token = ""
             if entry.get("node_id"):
                 graph_token = "{}|{}".format(entry.get("tid"), entry.get("node_id"))
@@ -2328,6 +2451,7 @@ class FunctionSearchPanel(QWidget):
                          "{}|{}|{}".format(entry["module"], entry["offset"], graph_token))
             self._tree.addTopLevelItem(item)
         self._tree.resizeColumnToContents(0)
+        self._tree.resizeColumnToContents(1)
 
     def _activate(self, item, _column=0):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2371,6 +2495,9 @@ class MainWindow(QMainWindow):
         self._frida_live_threads: list[QThread] = []
         self._frida_live_workers: list[FridaWorker] = []
         self._is_tracing     = False
+        self._trace_stopping = False
+        self._ghidra_connected = False
+        self._ghidra_connect_enabled = True
         self._frida_error_dialog_shown = False
         self._project_files: list[str] = []
 
@@ -2434,12 +2561,18 @@ class MainWindow(QMainWindow):
         h_split.addWidget(self._graph)
 
         # 오른쪽: 함수 검색
+        right = QWidget()
+        right_ly = QVBoxLayout(right)
+        right_ly.setContentsMargins(0, 0, 0, 0)
+        right_ly.setSpacing(0)
+
         self._func_panel = FunctionSearchPanel()
         self._func_panel.set_symbol_resolver(self._resolve_ghidra_symbol)
         self._func_panel.function_selected.connect(self._on_function_selected)
-        self._func_panel.setMinimumWidth(240)
-        self._func_panel.setMaximumWidth(360)
-        h_split.addWidget(self._func_panel)
+        right_ly.addWidget(self._func_panel, 1)
+        right.setMinimumWidth(320)
+        right.setMaximumWidth(560)
+        h_split.addWidget(right)
 
         h_split.setSizes([240, 960, 280])
         ly.addWidget(h_split)
@@ -2448,21 +2581,53 @@ class MainWindow(QMainWindow):
         self._sb.setStyleSheet(
             "background:#0078D4;color:white;font-size:12px;padding:2px 6px;")
         self.setStatusBar(self._sb)
+        self._ghidra_toggle_btn = QPushButton("Ghidra 대기 해제")
+        self._ghidra_toggle_btn.setStyleSheet(
+            "QPushButton{background:#FFFFFF;color:#1E293B;"
+            "border:1px solid #CBD5E1;border-radius:3px;padding:2px 8px;}"
+            "QPushButton:hover{background:#E2E8F0;}")
+        self._ghidra_toggle_btn.clicked.connect(self._toggle_ghidra_connection)
+        self._sb.addPermanentWidget(self._ghidra_toggle_btn)
         self._st("준비  |  Ghidra Script 연결 대기 중")
 
-    # ── Ghidra 서버 ─────────────────────────────────────────
+    # ── Ghidra 연결 ─────────────────────────────────────────
 
     def _setup_ghidra_server(self):
         self._ghidra_worker = GhidraServerWorker()
         self._ghidra_thread = QThread()
         self._ghidra_worker.moveToThread(self._ghidra_thread)
         self._ghidra_worker.status_changed.connect(self._st)
-        self._ghidra_worker.ghidra_connected.connect(
-            lambda c: self._st("Ghidra {}".format("연결됨" if c else "연결 해제")))
+        self._ghidra_worker.ghidra_connected.connect(self._on_ghidra_connected)
         self._ghidra_worker.project_info_recv.connect(self._on_project_info)
         self._ghidra_worker.sync_recv.connect(self._on_ghidra_sync)
         self._ghidra_thread.started.connect(self._ghidra_worker.run_server)
         self._ghidra_thread.start()
+
+    def _on_ghidra_connected(self, connected: bool):
+        self._ghidra_connected = connected
+        self._update_ghidra_toggle()
+        self._st("Ghidra {}".format("연결됨" if connected else "연결 해제"))
+
+    def _toggle_ghidra_connection(self):
+        if not self._ghidra_worker:
+            return
+        if self._ghidra_connect_enabled:
+            self._ghidra_connect_enabled = False
+            self._ghidra_worker.disconnect_ghidra(pause=True)
+        else:
+            self._ghidra_connect_enabled = True
+            self._ghidra_worker.resume_ghidra()
+        self._update_ghidra_toggle()
+
+    def _update_ghidra_toggle(self):
+        if not hasattr(self, "_ghidra_toggle_btn"):
+            return
+        if not self._ghidra_connect_enabled:
+            self._ghidra_toggle_btn.setText("Ghidra 연결 대기")
+        elif self._ghidra_connected:
+            self._ghidra_toggle_btn.setText("Ghidra 연결 해제")
+        else:
+            self._ghidra_toggle_btn.setText("Ghidra 대기 해제")
 
     def _on_project_info(self, files: list[str]):
         self._project_files = files
@@ -2497,11 +2662,12 @@ class MainWindow(QMainWindow):
 
     def _start_trace(self, target_path: str):
         if not self._check_unsaved(): return
-        if self._is_tracing:
-            self._st("이미 트레이스 중입니다.")
+        if self._is_tracing or self._trace_stopping or self._frida_worker:
+            self._st("트레이스 실행/종료 처리 중입니다.")
             return
         self._session    = TraceSession()
         self._is_tracing = True
+        self._trace_stopping = False
         self._frida_error_dialog_shown = False
         self._left.set_tracing(True)
 
@@ -2528,14 +2694,19 @@ class MainWindow(QMainWindow):
         self._st("트레이스 시작: {}".format(target_path))
 
     def _stop_trace(self):
+        if self._trace_stopping:
+            self._st("트레이스 종료 처리 중입니다.")
+            return
         if self._frida_worker:
+            self._trace_stopping = True
+            self._st("트레이스 종료 요청")
             self._stop_frida_requested.emit()
-        self._is_tracing = False
         self._left.set_tracing(False)
 
     def _on_trace_complete(self, session: TraceSession):
         self._session    = session
         self._is_tracing = False
+        self._trace_stopping = False
         self._left.set_tracing(False)
         self._left.update_loaded_modules(session.modules)
         self._graph.load_session(session)
@@ -2609,10 +2780,12 @@ class MainWindow(QMainWindow):
             self._frida_error_dialog_shown = True
             QMessageBox.critical(self, "Frida 오류", msg)
         self._is_tracing = False
+        self._trace_stopping = False
         self._left.set_tracing(False)
 
     def _on_frida_finished(self, worker: FridaWorker):
         self._is_tracing = False
+        self._trace_stopping = False
         self._left.set_tracing(False)
         try:
             self._stop_frida_requested.disconnect(worker.stop_trace)

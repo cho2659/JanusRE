@@ -52,13 +52,16 @@ interface ModuleEvent {
 interface SyncEvent {
   seq:       number;
   tid:       number;
+  api:       string;
   kind:      "set_event" | "pulse_event" | "release_mutex"
            | "wait_single" | "wait_multiple"
            | "queue_apc"   | "alpc"
            | "post_message" | "send_message"
            | "get_message"  | "peek_message";
   handle:    string;
+  handle_gen?: number;
   caller_va: string; // 타겟 모듈 내 역추적 VA, 없으면 "unknown"
+  status?:   string;
   msg_id?:   number;
   wparam?:   string;
   lparam?:   string;
@@ -67,21 +70,40 @@ interface SyncEvent {
 
 interface ThreadSpawnEvent {
   seq:        number;
+  api:        string;
   parent_tid: number;
   child_tid:  number;
+  thread_handle: string;
+  handle_gen?: number;
   creator_va: string; // 타겟 내 역추적 VA
   start_va:   string; // 새 스레드 시작 루틴 VA
+  status?:    string;
+}
+
+interface HandleEvent {
+  seq:        number;
+  tid:        number;
+  action:     "create" | "duplicate" | "close";
+  api:        string;
+  handle:     string;
+  handle_gen: number;
+  status?:    string;
+  kind?:      string;
+  source_handle?: string;
+  source_gen?: number;
 }
 
 interface AgentPayload {
   type:         "trace_complete" | "trace_chunk";
   session_id:   string;
   reason:       "exit" | "user_stop" | "periodic";
+  sent_at_ms:   number;
   events:       RawEvent[];
   snapshots:    StackSnapshot[];
   mod_events:   ModuleEvent[];
   sync_events:  SyncEvent[];
   spawn_events: ThreadSpawnEvent[];
+  handle_events: HandleEvent[];
 }
 
 // ══════════════════════════════════════════════════════════
@@ -93,6 +115,7 @@ const g_snapshots:    StackSnapshot[]     = [];
 const g_mod_events:   ModuleEvent[]       = [];
 const g_sync_events:  SyncEvent[]         = [];
 const g_spawn_events: ThreadSpawnEvent[]  = [];
+const g_handle_events: HandleEvent[]      = [];
 const g_stalked:      Set<number>         = new Set();
 const g_attach_failed:Set<number>         = new Set();
 
@@ -115,6 +138,10 @@ let g_sent_snapshots = 0;
 let g_sent_mod_events = 0;
 let g_sent_sync_events = 0;
 let g_sent_spawn_events = 0;
+let g_sent_handle_events = 0;
+
+const g_handle_gen_by_key: Map<string, number> = new Map();
+let g_next_handle_gen = 1;
 
 // 타겟 모듈 집합 (소문자). rpc.setTargets()로 갱신.
 let g_targets: Set<string> = new Set();
@@ -142,6 +169,34 @@ function ph(p: NativePointer): string {
 
 function nextSeq(): number { return g_seq++; }
 
+function ntStatus(rv: NativePointer): string {
+  return ph(rv);
+}
+
+function ntSuccess(rv: NativePointer): boolean {
+  return rv.toInt32() >= 0;
+}
+
+function handleKey(handle: NativePointer | string): string {
+  if (typeof handle === "string") return handle.toLowerCase();
+  return ph(handle).toLowerCase();
+}
+
+function recordHandleCreate(
+  api: string, handle: NativePointer, status: string, kind: string,
+): number {
+  const key = handleKey(handle);
+  const gen = g_next_handle_gen++;
+  g_handle_gen_by_key.set(key, gen);
+  const ev: HandleEvent = {
+    seq: nextSeq(), tid: Process.getCurrentThreadId(),
+    action: "create", api, handle: ph(handle), handle_gen: gen,
+    status, kind,
+  };
+  g_handle_events.push(ev);
+  return gen;
+}
+
 function isTarget(mod: { name: string } | null): boolean {
   if (!mod) return false;
   return g_targets.has(mod.name.toLowerCase());
@@ -161,12 +216,56 @@ function symbolName(addr: NativePointer): string {
   }
 }
 
+function asNativePointer(value: unknown): NativePointer | null {
+  if (value === null || value === undefined) return null;
+  try {
+    if (typeof value === "number") return ptr("0x" + value.toString(16));
+    if (typeof value === "string") return ptr(value);
+    const s = (value as { toString?: () => string }).toString;
+    if (typeof s === "function") return ptr(s.call(value));
+  } catch (_) {
+    return null;
+  }
+  return null;
+}
+
+function numberFromAny(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") return value;
+  if (typeof value === "string") {
+    const s = value.trim();
+    const n = s.startsWith("0x") || s.startsWith("-0x")
+      ? parseInt(s, 16)
+      : parseInt(s, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+  try {
+    const s = (value as { toString?: () => string }).toString;
+    if (typeof s === "function") return numberFromAny(s.call(value));
+  } catch (_) {}
+  return null;
+}
+
+function findModuleSafe(addr: NativePointer | null): Module | null {
+  if (!addr) return null;
+  try {
+    return Process.findModuleByAddress(addr);
+  } catch (_) {
+    return null;
+  }
+}
+
 /**
  * 콜스택 역추적: stack pointer를 읽어 리턴 어드레스 체인을 탐색.
  * 타겟 모듈 범위에 속하는 가장 가까운 프레임 VA 반환.
  * 찾지 못하면 "unknown".
  */
-function findTargetCaller(ctx: CpuContext): string {
+function findTargetCaller(ctx: CpuContext, immediateReturn?: NativePointer): string {
+  const immediateMod = findModuleSafe(immediateReturn || null);
+  if (immediateMod && g_targets.has(immediateMod.name.toLowerCase())) {
+    return ph(immediateReturn!);
+  }
+
   const arch = Process.arch;
   const x64 = ctx as X64CpuContext;
   const ia32 = ctx as Ia32CpuContext;
@@ -175,7 +274,7 @@ function findTargetCaller(ctx: CpuContext): string {
     let ra: NativePointer;
     try { ra = rsp.readPointer(); } catch (_) { break; }
     if (ra.isNull()) break;
-    const mod = Process.findModuleByAddress(ra);
+    const mod = findModuleSafe(ra);
     if (mod && g_targets.has(mod.name.toLowerCase())) return ph(ra);
     rsp = rsp.add(Process.pointerSize);
   }
@@ -183,7 +282,7 @@ function findTargetCaller(ctx: CpuContext): string {
 }
 
 function noteExternalCall(caller: NativePointer, target: NativePointer): void {
-  const targetMod = Process.findModuleByAddress(target);
+  const targetMod = findModuleSafe(target);
   g_last_external_call_by_tid.set(Process.getCurrentThreadId(), {
     caller_va: ph(caller),
     target_va: ph(target),
@@ -192,13 +291,15 @@ function noteExternalCall(caller: NativePointer, target: NativePointer): void {
   });
 }
 
-function consumeRecentExternalCaller(ctx: CpuContext): string {
+function consumeRecentExternalCaller(
+  ctx: CpuContext, immediateReturn?: NativePointer
+): string {
   const tid = Process.getCurrentThreadId();
   const last = g_last_external_call_by_tid.get(tid);
   if (last && Date.now() - last.at_ms <= LAST_EXTERNAL_CALL_TTL_MS) {
     return last.caller_va;
   }
-  return findTargetCaller(ctx);
+  return findTargetCaller(ctx, immediateReturn);
 }
 
 function directCallTarget(instr: X86Instruction): NativePointer | null {
@@ -208,27 +309,75 @@ function directCallTarget(instr: X86Instruction): NativePointer | null {
     const op = operands[0];
     const value = op.value;
     if ((op.type === "imm" || op.type === "immediate") && value !== undefined) {
-      if (typeof value === "number") return ptr(value);
-      if (typeof value === "string") {
-        try { return ptr(value); } catch (_) { return null; }
-      }
-      try { return value as NativePointer; } catch (_) { return null; }
+      return asNativePointer(value);
     }
   }
 
   const opStr = String(i.opStr || "");
+  if (opStr.indexOf("[") >= 0) return null;
   const m = opStr.match(/0x[0-9a-fA-F]+/);
   if (!m) return null;
   try { return ptr(m[0]); } catch (_) { return null; }
 }
 
+function readPointerSafe(addr: NativePointer | null): NativePointer | null {
+  if (!addr) return null;
+  try {
+    const p = addr.readPointer();
+    return p.isNull() ? null : p;
+  } catch (_) {
+    return null;
+  }
+}
+
+function memoryCallTarget(instr: X86Instruction): NativePointer | null {
+  const i = instr as any;
+  const src = asNativePointer(i.address);
+  if (!src) return null;
+
+  const operands = i.operands || [];
+  if (operands.length > 0) {
+    const op = operands[0];
+    if (op && (op.type === "mem" || op.type === "memory")) {
+      const value = op.value || op.mem || {};
+      const base = String(value.base || "").toLowerCase();
+      const disp = numberFromAny(value.disp ?? value.displacement);
+      if (Process.arch === "x64" && base === "rip" && disp !== null) {
+        const next = asNativePointer(i.next) || src.add(i.size || 0);
+        return readPointerSafe(next.add(disp));
+      }
+      if ((!base || base === "0" || base === "invalid") && disp !== null) {
+        return readPointerSafe(ptr("0x" + disp.toString(16)));
+      }
+    }
+  }
+
+  const opStr = String(i.opStr || "");
+  const rip = opStr.match(/\[\s*rip\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)\s*\]/i);
+  if (rip) {
+    const raw = numberFromAny(rip[2] || "");
+    if (raw !== null) {
+      const disp = rip[1] === "-" ? -raw : raw;
+      const next = asNativePointer(i.next) || src.add(i.size || 0);
+      return readPointerSafe(next.add(disp));
+    }
+  }
+  const absolute = opStr.match(/\[\s*(0x[0-9a-fA-F]+)\s*\]/i);
+  if (absolute && absolute[1]) return readPointerSafe(ptr(absolute[1]));
+  return null;
+}
+
+function callTarget(instr: X86Instruction): NativePointer | null {
+  return directCallTarget(instr) || memoryCallTarget(instr);
+}
+
 function shouldTrackExternalCallsite(instr: X86Instruction): NativePointer | null {
-  const src = (instr as any).address as NativePointer;
-  const srcMod = Process.findModuleByAddress(src);
+  const src = asNativePointer((instr as any).address);
+  const srcMod = findModuleSafe(src);
   if (!isTarget(srcMod)) return null;
-  const target = directCallTarget(instr);
+  const target = callTarget(instr);
   if (!target) return null;
-  const dstMod = Process.findModuleByAddress(target);
+  const dstMod = findModuleSafe(target);
   if (!dstMod || isTarget(dstMod)) return null;
   return target;
 }
@@ -408,8 +557,8 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
 
             const loc    = ev[1] as NativePointer;
             const target = ev[2] as NativePointer;
-            const srcMod = Process.findModuleByAddress(loc);
-            const dstMod = Process.findModuleByAddress(target);
+            const srcMod = findModuleSafe(loc);
+            const dstMod = findModuleSafe(target);
 
             // 타겟 필터: 출발지나 목적지 중 하나라도 타겟이어야 기록
             if (g_targets.size > 0) {
@@ -417,7 +566,7 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
             }
 
             const seq = nextSeq();
-            g_events.push({
+            const out: RawEvent = {
               k: ks === "call" ? 0 : 1,
               src: ph(loc), dst: ph(target),
               tid, seq,
@@ -427,7 +576,8 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
               dst_module: dstMod ? dstMod.name : "unknown",
               dst_offset: moduleOffset(target, dstMod),
               dst_symbol: symbolName(target),
-            });
+            };
+            g_events.push(out);
           }
         },
 
@@ -518,7 +668,8 @@ function beginTrace(initialTids: number[] = []): void {
       text: "trace_stats events=" + g_events.length
         + " snapshots=" + g_snapshots.length
         + " modules=" + g_mod_events.length
-        + " sync=" + g_sync_events.length,
+        + " sync=" + g_sync_events.length
+        + " handles=" + g_handle_events.length,
     });
   }, 1000);
 }
@@ -530,7 +681,10 @@ function beginTrace(initialTids: number[] = []): void {
 function hookThreadCreation(): void {
   const ntdll = Process.getModuleByName("ntdll.dll");
 
-  const onNewThread = (handlePtr: NativePointer, startVa: string, callerVa: string, parentTid: number) => {
+  const onNewThread = (
+    apiName: string, status: string, handlePtr: NativePointer,
+    startVa: string, callerVa: string, parentTid: number,
+  ) => {
     if (handlePtr.isNull()) {
       send({ type: "status", text: "thread_create_no_handle_ptr parent_tid=" + parentTid });
       scheduleFailureScan("thread_create_no_handle_ptr");
@@ -545,6 +699,7 @@ function hookThreadCreation(): void {
 
     const api = getThreadApi();
     const tid = api && api.getThreadId ? api.getThreadId(handle) : 0;
+    const gen = recordHandleCreate(apiName, handle, status, "thread");
     if (!tid) {
       send({ type: "status", text: "thread_create_no_tid parent_tid=" + parentTid + " start=" + startVa });
       scheduleFailureScan("thread_create_no_tid");
@@ -552,8 +707,11 @@ function hookThreadCreation(): void {
     }
 
     g_spawn_events.push({
-      seq: nextSeq(), parent_tid: parentTid, child_tid: tid,
+      seq: nextSeq(), api: apiName,
+      parent_tid: parentTid, child_tid: tid,
+      thread_handle: ph(handle), handle_gen: gen,
       creator_va: callerVa, start_va: startVa,
+      status,
     });
     send({
       type: "status",
@@ -573,12 +731,13 @@ function hookThreadCreation(): void {
       onEnter(args) {
         (this as any)._hp  = args[0]!;
         (this as any)._sv  = ph(args[4]!);
-        (this as any)._cv  = consumeRecentExternalCaller(this.context);
+        (this as any)._cv  = consumeRecentExternalCaller(
+          this.context, (this as any).returnAddress as NativePointer);
         (this as any)._pt  = Process.getCurrentThreadId();
       },
       onLeave(rv) {
         if (rv.toInt32() === 0)
-          onNewThread((this as any)._hp, (this as any)._sv,
+          onNewThread("NtCreateThreadEx", ntStatus(rv), (this as any)._hp, (this as any)._sv,
                       (this as any)._cv, (this as any)._pt);
       },
     });
@@ -590,157 +749,14 @@ function hookThreadCreation(): void {
       onEnter(args) {
         (this as any)._hp = args[0]!;
         (this as any)._sv = "unknown";
-        (this as any)._cv = consumeRecentExternalCaller(this.context);
+        (this as any)._cv = consumeRecentExternalCaller(
+          this.context, (this as any).returnAddress as NativePointer);
         (this as any)._pt = Process.getCurrentThreadId();
       },
       onLeave(rv) {
         if (rv.toInt32() === 0)
-          onNewThread((this as any)._hp, (this as any)._sv,
+          onNewThread("NtCreateThread", ntStatus(rv), (this as any)._hp, (this as any)._sv,
                       (this as any)._cv, (this as any)._pt);
-      },
-    });
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-// 동기화 이벤트 (ntdll)
-// ══════════════════════════════════════════════════════════
-
-function hookSync(): void {
-  type SyncDef = {
-    fn:     string;
-    kind:   SyncEvent["kind"];
-    handle: (a: InvocationArguments) => string;
-    extra?: (a: InvocationArguments, ev: Partial<SyncEvent>) => void;
-  };
-
-  const ntdll = Process.getModuleByName("ntdll.dll");
-
-  const defs: SyncDef[] = [
-    { fn: "NtSetEvent",     kind: "set_event",      handle: a => ph(a[0]!) },
-    { fn: "NtPulseEvent",   kind: "pulse_event",    handle: a => ph(a[0]!) },
-    { fn: "NtReleaseMutant",kind: "release_mutex",  handle: a => ph(a[0]!) },
-    {
-      fn: "NtWaitForSingleObject", kind: "wait_single", handle: a => ph(a[0]!),
-      extra: (a, ev) => {
-        if (!a[2]!.isNull()) {
-          try {
-            const v = a[2]!.readS64();
-            ev.timeout = v.compare(0) < 0 ? Math.round(Number(v.toNumber() * -1) / 10000) : -2;
-          } catch (_) { ev.timeout = -1; }
-        } else { ev.timeout = -1; }
-      },
-    },
-    {
-      fn: "NtWaitForMultipleObjects", kind: "wait_multiple", handle: a => ph(a[1]!),
-      extra: (a, ev) => {
-        if (!a[3]!.isNull()) {
-          try {
-            const v = a[3]!.readS64();
-            ev.timeout = v.compare(0) < 0 ? Math.round(Number(v.toNumber() * -1) / 10000) : -2;
-          } catch (_) { ev.timeout = -1; }
-        } else { ev.timeout = -1; }
-      },
-    },
-    { fn: "NtQueueApcThread",          kind: "queue_apc", handle: a => ph(a[0]!) },
-    { fn: "NtAlpcSendWaitReceivePort", kind: "alpc",      handle: a => ph(a[0]!) },
-  ];
-
-  for (const d of defs) {
-    const addr = ntdll.findExportByName(d.fn);
-    if (!addr) continue;
-    Interceptor.attach(addr, {
-      onEnter(args) {
-        const ev: Partial<SyncEvent> = {
-          seq:       nextSeq(),
-          tid:       Process.getCurrentThreadId(),
-          kind:      d.kind,
-          handle:    d.handle(args),
-          caller_va: consumeRecentExternalCaller(this.context),
-        };
-        if (d.extra) d.extra(args, ev);
-        g_sync_events.push(ev as SyncEvent);
-      },
-    });
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-// 유저 입력 / GUI 메시지 (user32)
-// ══════════════════════════════════════════════════════════
-
-function hookUserInput(): void {
-  const u32 = Process.findModuleByName("user32.dll");
-  if (!u32) return;
-
-  // MSG 구조체에서 필드 읽기:
-  // x86: hwnd[4] message[4] wParam[4] lParam[4]
-  // x64: hwnd[8] message[4] padding[4] wParam[8] lParam[8]
-  const readMsg = (lpMsg: NativePointer) => {
-    try {
-      const ps = Process.pointerSize;
-      const msgOff = ps;
-      const wparamOff = ps === 4 ? 8 : 16;
-      const lparamOff = wparamOff + ps;
-      return {
-        hwnd:   ph(lpMsg.readPointer()),
-        msg_id: lpMsg.add(msgOff).readU32(),
-        wparam: ph(lpMsg.add(wparamOff).readPointer()),
-        lparam: ph(lpMsg.add(lparamOff).readPointer()),
-      };
-    } catch (_) { return null; }
-  };
-
-  const getMsgAddr = u32.findExportByName("GetMessageW");
-  if (getMsgAddr) {
-    Interceptor.attach(getMsgAddr, {
-      onEnter(args) { (this as any)._lp = args[0]!; (this as any)._cv = consumeRecentExternalCaller(this.context); },
-      onLeave(rv) {
-        if (rv.toInt32() <= 0) return;
-        const m = readMsg((this as any)._lp);
-        if (!m) return;
-        g_sync_events.push({ seq: nextSeq(), tid: Process.getCurrentThreadId(),
-          kind: "get_message", handle: m.hwnd, caller_va: (this as any)._cv,
-          msg_id: m.msg_id, wparam: m.wparam, lparam: m.lparam });
-      },
-    });
-  }
-
-  const peekMsgAddr = u32.findExportByName("PeekMessageW");
-  if (peekMsgAddr) {
-    Interceptor.attach(peekMsgAddr, {
-      onEnter(args) { (this as any)._lp = args[0]!; (this as any)._cv = consumeRecentExternalCaller(this.context); },
-      onLeave(rv) {
-        if (rv.toInt32() === 0) return;
-        const m = readMsg((this as any)._lp);
-        if (!m) return;
-        g_sync_events.push({ seq: nextSeq(), tid: Process.getCurrentThreadId(),
-          kind: "peek_message", handle: m.hwnd, caller_va: (this as any)._cv,
-          msg_id: m.msg_id, wparam: m.wparam, lparam: m.lparam });
-      },
-    });
-  }
-
-  // PostMessageW(hWnd, Msg, wParam, lParam)
-  const postMsg = u32.findExportByName("PostMessageW");
-  if (postMsg) {
-    Interceptor.attach(postMsg, {
-      onEnter(args) {
-        g_sync_events.push({ seq: nextSeq(), tid: Process.getCurrentThreadId(),
-          kind: "post_message", handle: ph(args[0]!), caller_va: consumeRecentExternalCaller(this.context),
-          msg_id: args[1]!.toInt32(), wparam: ph(args[2]!), lparam: ph(args[3]!) });
-      },
-    });
-  }
-
-  // SendMessageW(hWnd, Msg, wParam, lParam)
-  const sendMsg = u32.findExportByName("SendMessageW");
-  if (sendMsg) {
-    Interceptor.attach(sendMsg, {
-      onEnter(args) {
-        g_sync_events.push({ seq: nextSeq(), tid: Process.getCurrentThreadId(),
-          kind: "send_message", handle: ph(args[0]!), caller_va: consumeRecentExternalCaller(this.context),
-          msg_id: args[1]!.toInt32(), wparam: ph(args[2]!), lparam: ph(args[3]!) });
       },
     });
   }
@@ -783,19 +799,23 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
   const modEvents = g_mod_events.slice(g_sent_mod_events);
   const syncEvents = g_sync_events.slice(g_sent_sync_events);
   const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
+  const handleEvents = g_handle_events.slice(g_sent_handle_events);
 
   if (
     events.length === 0 && snapshots.length === 0 && modEvents.length === 0
     && syncEvents.length === 0 && spawnEvents.length === 0
+    && handleEvents.length === 0
   ) {
     return;
   }
 
   send({
     type: "trace_chunk", session_id: SESSION_ID, reason,
+    sent_at_ms: Date.now(),
     events, snapshots,
     mod_events: modEvents, sync_events: syncEvents,
     spawn_events: spawnEvents,
+    handle_events: handleEvents,
   } as AgentPayload);
 
   g_sent_events = g_events.length;
@@ -803,6 +823,7 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
   g_sent_mod_events = g_mod_events.length;
   g_sent_sync_events = g_sync_events.length;
   g_sent_spawn_events = g_spawn_events.length;
+  g_sent_handle_events = g_handle_events.length;
 }
 
 function flushAndSend(reason: "exit" | "user_stop"): void {
@@ -824,9 +845,11 @@ function flushAndSend(reason: "exit" | "user_stop"): void {
   sendTraceChunk(reason);
   send({
     type: "trace_complete", session_id: SESSION_ID, reason,
+    sent_at_ms: Date.now(),
     events: [], snapshots: [],
     mod_events: [], sync_events: [],
     spawn_events: [],
+    handle_events: [],
   } as AgentPayload);
 }
 
@@ -872,7 +895,5 @@ rpc.exports = {
 
   hookModules();
   hookThreadCreation();
-  hookSync();
-  hookUserInput();
   hookExit();
 })();
