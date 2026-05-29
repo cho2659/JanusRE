@@ -85,22 +85,25 @@ def dbg(msg: str):
 # 색상 (IDA Pro 라이트 테마)
 # ============================================================
 
-C_BG          = QColor("#F5F5F5")   # 캔버스 배경
-C_NODE_BG     = QColor("#FFFFFF")   # 일반 노드
-C_NODE_BORDER = QColor("#C0C8D0")   # 노드 테두리
-C_NODE_SEL    = QColor("#0078D4")   # 선택 강조
-C_NODE_SEARCH = QColor("#D4820A")   # 검색 강조
-C_NODE_ENTRY  = QColor("#E8F4E8")   # 진입 노드 배경
-C_NODE_EXIT   = QColor("#FDE8E8")   # 종료 노드 배경
-C_TEXT_FUNC   = QColor("#1F3864")   # 함수명 (진한 네이비)
-C_TEXT_ADDR   = QColor("#0060A8")   # 주소 (IDA 블루)
-C_TEXT_SUB    = QColor("#6B7280")   # 보조 텍스트
-C_TEXT_ARG    = QColor("#005FAF")   # 인자 레지스터
-C_TEXT_RET    = QColor("#007050")   # 반환값
-C_EDGE_CALL   = QColor("#0078D4")   # call 엣지
-C_EDGE_RET    = QColor("#9CA3AF")   # ret 엣지
-C_EDGE_SYNC   = QColor("#B45309")   # sync 엣지
-C_EDGE_SPAWN  = QColor("#7C3AED")   # spawn 엣지
+C_BG           = QColor("#F5F5F5")   # 캔버스 배경
+C_NODE_BG      = QColor("#FFFFFF")   # 일반 노드
+C_NODE_EXTERNAL= QColor("#F0F4FF")   # 외부 모듈 노드 배경
+C_NODE_BORDER  = QColor("#C0C8D0")   # 노드 테두리
+C_NODE_BORDER_EXT = QColor("#A0A8C0")# 외부 모듈 노드 테두리
+C_NODE_SEL     = QColor("#0078D4")   # 선택 강조
+C_NODE_SEARCH  = QColor("#D4820A")   # 검색 강조
+C_NODE_ENTRY   = QColor("#E8F4E8")   # 진입 노드 배경
+C_NODE_EXIT    = QColor("#FDE8E8")   # 종료 노드 배경
+C_TEXT_FUNC    = QColor("#1F3864")   # 함수명 (진한 네이비)
+C_TEXT_EXT_MOD = QColor("#6050A0")   # 외부 모듈명 (퍼플)
+C_TEXT_ADDR    = QColor("#0060A8")   # 주소 (IDA 블루)
+C_TEXT_SUB     = QColor("#6B7280")   # 보조 텍스트
+C_TEXT_ARG     = QColor("#005FAF")   # 인자 레지스터
+C_TEXT_RET     = QColor("#007050")   # 반환값
+C_EDGE_CALL    = QColor("#0078D4")   # call 엣지
+C_EDGE_RET     = QColor("#9CA3AF")   # ret 엣지
+C_EDGE_SYNC    = QColor("#B45309")   # sync 엣지
+C_EDGE_SPAWN   = QColor("#7C3AED")   # spawn 엣지
 
 FONT_MAIN = QFont("Consolas", 9)
 FONT_ADDR = QFont("Consolas", 8)
@@ -124,10 +127,12 @@ class CallNode:
         "node_id", "module", "symbol", "offset",
         "src_module", "src_symbol", "src_offset",
         "tid", "call_seq", "trace_seq", "depth",
-        "args", "retval",
         "children_ids", "parent_id",
-        "spawn_tid", "spawned_by_id",
-        "is_entry", "is_exit",
+        "spawn_tid", "spawn_start_sym",
+        "spawn_child_node_id", "spawn_child_tid",
+        "spawned_by_id", "spawned_by_tid",
+        "spawned_by_label", "spawn_start_label",
+        "is_entry", "is_exit", "is_external",
         "expanded",
     )
 
@@ -144,19 +149,27 @@ class CallNode:
         self.call_seq       = call_seq
         self.trace_seq      = call_seq
         self.depth          = depth
-        self.args:          Optional[dict] = None
-        self.retval:        Optional[str]  = None
         self.children_ids:  list[str] = []
         self.parent_id:     Optional[str]  = None
-        self.spawn_tid:     Optional[int]  = None
-        self.spawned_by_id: Optional[str]  = None
-        self.is_entry = False
-        self.is_exit  = False
-        self.expanded = False
+        self.spawn_tid:          Optional[int]  = None
+        self.spawn_start_sym:    str            = ""
+        self.spawn_child_node_id: Optional[str] = None   # 자식 스레드 루트 node_id
+        self.spawn_child_tid:     Optional[int] = None   # 자식 스레드 TID
+        self.spawned_by_id:      Optional[str]  = None
+        self.spawned_by_tid:     Optional[int]  = None   # 생성한 부모 스레드 TID
+        self.spawned_by_label:   str            = ""
+        self.spawn_start_label:  str            = ""
+        self.is_entry    = False
+        self.is_exit     = False
+        self.is_external = False  # 타겟 외부 모듈 함수 호출 노드
+        self.expanded    = False
 
     def label(self) -> str:
-        return self.symbol if self.symbol else "{}+{}".format(
-            self.module, hex(self.offset))
+        if self.symbol:
+            return self.symbol
+        if self.is_external and self.module and not self.module.startswith("["):
+            return "{}!+{}".format(self.module, hex(self.offset))
+        return "{}+{}".format(self.module, hex(self.offset))
 
     def addr_str(self) -> str:
         if self.module.startswith("["):
@@ -191,36 +204,32 @@ class CallEdge:
 # ============================================================
 
 class CallTreeBuilder:
-    """
-    TraceSession → {tid: (nodes, edges)} 변환.
+    """TraceSession → {tid: (nodes, edges)} 변환.
 
-    스냅샷 매칭:
-      postprocess_events가 seq를 보존하지 않으므로
-      이벤트 인덱스(call_seq)를 기반으로 스냅샷 배열의
-      같은 인덱스 위치 스냅샷을 사용한다.
-      (enter 스냅샷 인덱스 = call 이벤트 순서, kind=0)
-      (ret   스냅샷 인덱스 = ret  이벤트 순서, kind=1)
+    부모-자식 관계 원칙:
+      - 부모는 같은 TID의 동적 call stack top으로만 결정한다.
+      - call 이벤트: 현재 stack top이 부모이고, 새 dst 함수가 자식이다.
+      - ret 이벤트: 현재 stack top을 pop한다.
+      - stack이 비어 있을 때 나온 call은 새 root다.
+      - 시간상 다음 root를 부모/자식으로 연결하지 않는다.
+
+    이유:
+      FUN_A가 FUN_B를 호출한 뒤 ret로 빠져나온 다음 FUN_C가 실행되면,
+      FUN_C는 FUN_A의 하위 호출이 아니다. 이전 구현의 flow edge는 이런
+      "다음 실행"을 점선으로 연결했고, 실제 call 관계처럼 보여 오해를 만들었다.
     """
 
-    def __init__(self, symbol_resolver=None):
+    def __init__(self, symbol_resolver=None, target_modules: Optional[list[str]] = None):
         self._symbol_resolver = symbol_resolver
+        self._target_modules = self._normalize_targets(target_modules or [])
 
     def build(self, session) -> dict[int, tuple[dict, list]]:
-        # 스냅샷을 (tid, kind) → 순서 큐로 구성
-        enter_snaps: dict[int, list[dict]] = {}
-        ret_snaps:   dict[int, list[dict]] = {}
-        for snap in session.snapshots:
-            tid  = snap.get("tid", 0)
-            kind = snap.get("kind", 0)
-            if kind == 0:
-                enter_snaps.setdefault(tid, []).append(snap)
-            else:
-                ret_snaps.setdefault(tid, []).append(snap)
-
         # 스레드별 이벤트 분리
         by_tid: dict[int, list[dict]] = {}
         for ev in session.events:
             if ev.get("type") not in ("call", "ret"):
+                continue
+            if not self._is_graph_event(ev):
                 continue
             tid = ev.get("thread_id", 0)
             by_tid.setdefault(tid, []).append(ev)
@@ -233,17 +242,26 @@ class CallTreeBuilder:
         # spawn 이벤트: child_tid → spawn
         spawn_by_child: dict[int, dict] = {
             s["child_tid"]: s for s in getattr(session, "spawn_events", [])
+            if s.get("child_tid") is not None
         }
 
         result: dict[int, tuple[dict, list]] = {}
-        for tid in sorted(set(by_tid.keys()) | set(sync_by_tid.keys())):
+        spawn_tids: set[int] = set()
+        for s in getattr(session, "spawn_events", []):
+            if s.get("parent_tid") is not None:
+                spawn_tids.add(int(s.get("parent_tid")))
+            if s.get("child_tid") is not None:
+                spawn_tids.add(int(s.get("child_tid")))
+
+        for tid in sorted(set(by_tid.keys()) | set(sync_by_tid.keys()) | spawn_tids):
             events = by_tid.get(tid, [])
             nodes, edges = self._build_thread(
                 tid, events,
-                enter_snaps.get(tid, []),
-                ret_snaps.get(tid, []),
                 sync_by_tid.get(tid, []),
             )
+            if not nodes:
+                nodes, edges = self._build_placeholder_thread(
+                    tid, spawn_by_child.get(tid))
             result[tid] = (nodes, edges)
 
         self._link_spawns(result, spawn_by_child)
@@ -251,17 +269,14 @@ class CallTreeBuilder:
 
     def _build_thread(
         self, tid: int, events: list[dict],
-        enter_snaps: list[dict],
-        ret_snaps:   list[dict],
         sync_events: list[dict],
     ) -> tuple[dict, list]:
         nodes: dict[str, CallNode] = {}
         edges: list[CallEdge]      = []
         stack: list[str]           = []
         call_counter: dict[str, int] = {}
-        call_seq  = 0
-        enter_idx = 0
-        ret_idx   = 0
+        caller_anchors: dict[tuple[str, str, str], str] = {}
+        call_seq = 0
 
         timeline = (
             [(ev.get("seq", i), "trace", ev) for i, ev in enumerate(events)]
@@ -297,21 +312,32 @@ class CallTreeBuilder:
             if ev_type == "call":
                 src_mod = ev.get("src_module", "unknown")
                 src_off = self._hex(ev.get("src_offset", "0x0"))
-                src_sym = self._display_symbol(
-                    src_mod, ev.get("src_offset", "0x0"))
+                src_sym = ev.get("src_symbol", "")
                 if not src_sym:
-                    src_sym = ev.get("src_symbol", "")
+                    src_sym = self._display_symbol(
+                        src_mod, ev.get("src_offset", "0x0"))
 
                 dst_mod = ev.get("dst_module", "unknown")
                 dst_off = self._hex(ev.get("dst_offset", "0x0"))
-                dst_sym = self._display_symbol(
-                    dst_mod, ev.get("dst_offset", "0x0"))
+                dst_external = bool(ev.get("dst_is_external", False))
+                dst_sym = ev.get("dst_symbol", "")
                 if not dst_sym:
-                    dst_sym = ev.get("dst_symbol", "")
+                    dst_sym = self._display_symbol(
+                        dst_mod, ev.get("dst_offset", "0x0"))
 
                 base_key = "{}+{}".format(dst_mod, hex(dst_off))
                 call_counter[base_key] = call_counter.get(base_key, 0) + 1
                 node_id = "{}_{}".format(base_key, call_counter[base_key])
+                parent_id = stack[-1] if stack else None
+                if ev.get("source") == "target_export":
+                    parent_id = self._source_anchor_node(
+                        nodes, caller_anchors, tid, src_mod, src_off, src_sym,
+                        call_seq, ev.get("seq", call_seq))
+                depth = (
+                    nodes[parent_id].depth + 1
+                    if parent_id and parent_id in nodes
+                    else len(stack)
+                )
 
                 node = CallNode(
                     node_id  = node_id,
@@ -320,7 +346,7 @@ class CallTreeBuilder:
                     offset   = dst_off,
                     tid      = tid,
                     call_seq = call_seq,
-                    depth    = len(stack),
+                    depth    = depth,
                 )
                 node.trace_seq = ev.get("seq", call_seq)
                 node.src_module = src_mod
@@ -328,45 +354,118 @@ class CallTreeBuilder:
                 node.src_symbol = src_sym
                 call_seq += 1
 
-                # enter 스냅샷 (순서 기반)
-                if enter_idx < len(enter_snaps):
-                    snap = enter_snaps[enter_idx]
-                    node.args = {
-                        "arch": snap.get("arch", "x64"),
-                        "rcx": snap.get("rcx", ""),
-                        "rdx": snap.get("rdx", ""),
-                        "r8":  snap.get("r8",  ""),
-                        "r9":  snap.get("r9",  ""),
-                    }
-                    enter_idx += 1
+                # 외부 모듈 여부 판별 (타겟 집합에 없는 모듈)
+                if (dst_external
+                        or (self._target_modules
+                        and dst_mod != "unknown"
+                        and not dst_mod.startswith("[")
+                        and not self._is_target_module(dst_mod))):
+                    node.is_external = True
+                    if not node.symbol and dst_mod != "unknown":
+                        node.symbol = "{}!+{}".format(dst_mod, hex(dst_off))
 
                 # exit 판별
                 lbl = (dst_sym or "").lower()
                 if any(x in lbl for x in ("exit", "terminate", "abort")):
                     node.is_exit = True
 
-                if stack:
-                    node.parent_id = stack[-1]
-                    if stack[-1] in nodes:
-                        nodes[stack[-1]].children_ids.append(node_id)
-                    edges.append(CallEdge(stack[-1], node_id, "call", tid))
+                if parent_id:
+                    node.parent_id = parent_id
+                    if parent_id in nodes:
+                        nodes[parent_id].children_ids.append(node_id)
+                    edges.append(CallEdge(parent_id, node_id, "call", tid))
                 else:
                     node.is_entry = True
 
                 nodes[node_id] = node
                 stack.append(node_id)
 
-            elif ev_type == "ret" and stack:
-                ret_node_id = stack[-1]
-                # ret 스냅샷 (순서 기반)
-                if ret_idx < len(ret_snaps) and ret_node_id in nodes:
-                    snap = ret_snaps[ret_idx]
-                    nodes[ret_node_id].retval = snap.get("rax", "")
-                    ret_idx += 1
-                stack.pop()
+            elif ev_type == "ret":
+                if self._is_external_to_target_ret(ev):
+                    src_mod = ev.get("src_module", "unknown")
+                    src_off = self._hex(ev.get("src_offset", "0x0"))
+                    src_sym = ev.get("src_symbol", "")
+                    dst_mod = ev.get("dst_module", "unknown")
+                    dst_off = self._hex(ev.get("dst_offset", "0x0"))
+                    dst_sym = ev.get("dst_symbol", "")
 
-        self._link_roots_by_time(nodes, edges, tid)
+                    base_key = "ret_{}+{}".format(dst_mod, hex(dst_off))
+                    call_counter[base_key] = call_counter.get(base_key, 0) + 1
+                    node_id = "{}_{}".format(base_key, call_counter[base_key])
+                    parent_id = stack[-1] if stack else None
+                    depth = (
+                        nodes[parent_id].depth + 1
+                        if parent_id and parent_id in nodes
+                        else len(stack)
+                    )
+                    node = CallNode(
+                        node_id=node_id,
+                        module=dst_mod,
+                        symbol=dst_sym,
+                        offset=dst_off,
+                        tid=tid,
+                        call_seq=call_seq,
+                        depth=depth,
+                    )
+                    node.trace_seq = ev.get("seq", call_seq)
+                    node.src_module = src_mod
+                    node.src_offset = src_off
+                    node.src_symbol = src_sym
+                    call_seq += 1
+                    if parent_id:
+                        node.parent_id = parent_id
+                        if parent_id in nodes:
+                            nodes[parent_id].children_ids.append(node_id)
+                        edges.append(CallEdge(parent_id, node_id, "flow", tid))
+                    else:
+                        node.is_entry = True
+                    nodes[node_id] = node
+                if stack:
+                    stack.pop()
+
         return nodes, edges
+
+    def _build_placeholder_thread(
+        self, tid: int, spawn_ev: Optional[dict],
+    ) -> tuple[dict, list]:
+        """이벤트가 아직 없는 스레드도 탭에서 보이도록 시작 노드를 만든다.
+
+        사용자 입력/메시지 루프 이후에만 타겟 함수가 실행되는 스레드는
+        NtCreateThread 계열 생성 이벤트만 있고 Stalker call 이벤트가 비어 있을
+        수 있다. 이 경우도 분석 대상 스레드이므로 탭을 유지하고, 생성 시점에
+        확보한 start routine 정보를 루트 노드로 표시한다.
+        """
+        module = "[thread]"
+        symbol = "Thread {} start".format(tid)
+        offset = 0
+        trace_seq = 0
+        if spawn_ev:
+            module = spawn_ev.get("start_module", "") or "[thread]"
+            if module == "unknown":
+                module = "[thread]"
+            symbol = spawn_ev.get("start_symbol", "") or ""
+            if not symbol:
+                if module.startswith("["):
+                    symbol = "Thread {} start".format(tid)
+                else:
+                    symbol = "{}!{}".format(
+                        module, spawn_ev.get("start_offset", "0x0"))
+            offset = self._hex(spawn_ev.get("start_offset", "0x0"))
+            trace_seq = int(spawn_ev.get("seq", 0))
+
+        node_id = "thread_start_{}".format(tid)
+        node = CallNode(
+            node_id=node_id,
+            module=module,
+            symbol=symbol,
+            offset=offset,
+            tid=tid,
+            call_seq=0,
+            depth=0,
+        )
+        node.trace_seq = trace_seq
+        node.is_entry = True
+        return {node_id: node}, []
 
     @staticmethod
     def _sync_label(ev: dict) -> str:
@@ -402,25 +501,81 @@ class CallTreeBuilder:
         return label
 
     def _display_symbol(self, module: str, offset_hex: str) -> str:
-        if not self._symbol_resolver:
-            return ""
-        try:
-            return self._symbol_resolver(module, offset_hex) or ""
-        except Exception:
-            return ""
+        return ""
+
+    def _source_anchor_node(
+        self,
+        nodes: dict[str, CallNode],
+        anchors: dict[tuple[str, str, str], str],
+        tid: int,
+        src_mod: str,
+        src_off: int,
+        src_sym: str,
+        call_seq: int,
+        trace_seq: int,
+    ) -> Optional[str]:
+        if not src_mod or src_mod == "unknown":
+            return None
+        key = (src_mod.lower(), src_sym.lower(), hex(src_off).lower())
+        if key in anchors and anchors[key] in nodes:
+            return anchors[key]
+
+        anchor_id = "caller_{}_{}_{}".format(
+            tid, len(anchors), abs(hash(key)) & 0xFFFF)
+        node = CallNode(
+            node_id=anchor_id,
+            module=src_mod,
+            symbol=src_sym,
+            offset=src_off,
+            tid=tid,
+            call_seq=call_seq,
+            depth=0,
+        )
+        node.trace_seq = trace_seq
+        node.is_entry = True
+        nodes[anchor_id] = node
+        anchors[key] = anchor_id
+        return anchor_id
+
+    def _is_graph_event(self, ev: dict) -> bool:
+        """수집 이벤트 중 그래프에 표시할 타겟 경계/내부 이벤트만 통과시킨다.
+
+        Stalker/Interceptor는 누락 방지를 위해 넓게 수집하지만, 그래프는
+        타겟 내부 호출과 타겟<->외부 경계만 표시한다. 따라서
+        내부->외부->외부->내부 흐름은 첫 내부->외부 진입과 마지막
+        외부->내부 복귀만 남고, 중간 외부->외부 호출은 숨겨진다.
+        """
+        if not self._target_modules:
+            return True
+        src_target = self._is_target_module(ev.get("src_module", ""))
+        dst_target = self._is_target_module(ev.get("dst_module", ""))
+        return src_target or dst_target
+
+    def _is_external_to_target_ret(self, ev: dict) -> bool:
+        if ev.get("type") != "ret":
+            return False
+        return (
+            not self._is_target_module(ev.get("src_module", ""))
+            and self._is_target_module(ev.get("dst_module", ""))
+        )
 
     @staticmethod
-    def _link_roots_by_time(nodes: dict[str, CallNode],
-                            edges: list[CallEdge], tid: int):
-        roots = sorted(
-            [n for n in nodes.values() if n.parent_id is None],
-            key=lambda n: n.call_seq)
-        for prev, cur in zip(roots, roots[1:]):
-            cur.parent_id = prev.node_id
-            cur.depth = max(cur.depth, prev.depth + 1)
-            if cur.node_id not in prev.children_ids:
-                prev.children_ids.append(cur.node_id)
-            edges.append(CallEdge(prev.node_id, cur.node_id, "flow", tid))
+    def _normalize_targets(modules: list[str]) -> set[str]:
+        out: set[str] = set()
+        for mod in modules:
+            name = Path(str(mod)).name.lower()
+            if not name:
+                continue
+            out.add(name)
+            out.add(name.rsplit(".", 1)[0])
+        return out
+
+    def _is_target_module(self, module: str) -> bool:
+        if not module or module == "unknown":
+            return False
+        name = Path(str(module)).name.lower()
+        stem = name.rsplit(".", 1)[0]
+        return name in self._target_modules or stem in self._target_modules
 
     @staticmethod
     def _hex(v) -> int:
@@ -436,44 +591,164 @@ class CallTreeBuilder:
     ):
         for child_tid, spawn_ev in spawn_by_child.items():
             parent_tid = spawn_ev.get("parent_tid", -1)
-            creator_va = spawn_ev.get("creator_va", "unknown")
             if parent_tid not in result or child_tid not in result:
                 continue
 
             parent_nodes, parent_edges = result[parent_tid]
             child_nodes, _             = result[child_tid]
 
-            # 부모: creator_va로 가장 가까운 노드 찾기
-            creator_id: Optional[str] = None
-            if creator_va != "unknown":
-                try:
-                    va_int = int(creator_va, 16)
-                except Exception:
-                    va_int = 0
-                best_dist = float("inf")
-                for nid, n in parent_nodes.items():
-                    dist = abs(n.offset - va_int)
-                    if dist < best_dist:
-                        best_dist = dist
-                        creator_id = nid
+            creator_id = CallTreeBuilder._find_spawn_creator_node(
+                parent_nodes, spawn_ev)
+            if creator_id is None:
+                creator_id = CallTreeBuilder._fallback_spawn_creator_node(
+                    parent_nodes, spawn_ev)
 
-            # 자식: 루트 노드
+            # 자식: 루트 노드 (is_entry인 것, 없으면 call_seq 최소)
             child_root_id: Optional[str] = None
             for nid, n in child_nodes.items():
                 if n.is_entry:
                     child_root_id = nid
                     break
+            if child_root_id is None and child_nodes:
+                child_root_id = min(child_nodes, key=lambda k: child_nodes[k].call_seq)
 
             if creator_id and child_root_id:
-                parent_nodes[creator_id].spawn_tid = child_tid
-                child_nodes[child_root_id].spawned_by_id = creator_id
+                cn = parent_nodes[creator_id]
+                cn.spawn_tid           = child_tid
+                cn.spawn_child_node_id = child_root_id
+                cn.spawn_child_tid     = child_tid
+                cn.spawn_start_sym = CallTreeBuilder._spawn_start_label(
+                    spawn_ev, child_nodes[child_root_id])
+
+                child_root = child_nodes[child_root_id]
+                child_root.spawned_by_id  = creator_id
+                child_root.spawned_by_tid = parent_tid
+                child_root.spawned_by_label = cn.label()
+                child_root.spawn_start_label = cn.spawn_start_sym
+
                 parent_edges.append(
                     CallEdge(creator_id, child_root_id, "spawn", parent_tid))
+
+    @staticmethod
+    def _find_spawn_creator_node(
+        parent_nodes: dict[str, CallNode],
+        spawn_ev: dict,
+    ) -> Optional[str]:
+        """스레드 생성자를 모듈+오프셋 기준으로 찾는다.
+
+        Frida 에이전트는 Process.findModuleByAddress()로 creator_va를
+        creator_module/creator_offset으로 변환해 보낸다. 여기서는 raw VA와
+        module offset을 섞어 비교하지 않는다.
+
+        우선순위:
+          1. 노드의 src_module/src_offset이 생성 callsite와 정확히 일치
+          2. 노드 자체 module/offset이 정확히 일치
+          3. 같은 모듈에서 creator_offset 직전의 함수 entry로 추정
+          4. 같은 모듈에서 가장 가까운 src_offset 또는 node offset
+        """
+        creator_module = str(spawn_ev.get("creator_module", "")).lower()
+        creator_offset = CallTreeBuilder._hex(
+            spawn_ev.get("creator_offset", "0x0"))
+        if not creator_module or creator_module == "unknown":
+            return None
+
+        best: tuple[int, int, int, str] | None = None
+        for idx, (nid, n) in enumerate(parent_nodes.items()):
+            n_mod = (n.module or "").lower()
+            src_mod = (n.src_module or "").lower()
+            candidates: list[tuple[int, int]] = []
+
+            if src_mod == creator_module:
+                src_dist = abs(n.src_offset - creator_offset)
+                candidates.append((0 if src_dist == 0 else 3, src_dist))
+            if n_mod == creator_module:
+                node_dist = abs(n.offset - creator_offset)
+                if node_dist == 0:
+                    candidates.append((1, 0))
+                elif n.offset <= creator_offset:
+                    candidates.append((2, creator_offset - n.offset))
+                else:
+                    candidates.append((4, node_dist))
+
+            for rank, dist in candidates:
+                score = (rank, dist, idx, nid)
+                if best is None or score < best:
+                    best = score
+
+        return best[3] if best else None
+
+    @staticmethod
+    def _fallback_spawn_creator_node(
+        parent_nodes: dict[str, CallNode],
+        spawn_ev: dict,
+    ) -> Optional[str]:
+        """정확한 생성 callsite가 없을 때 탭 고립을 막는 보조 매칭."""
+        if not parent_nodes:
+            return None
+        seq = int(spawn_ev.get("seq", 0))
+        before = [
+            n for n in parent_nodes.values()
+            if int(getattr(n, "trace_seq", 0)) <= seq
+        ]
+        if before:
+            return max(before, key=lambda n: n.trace_seq).node_id
+        entries = [n for n in parent_nodes.values() if n.is_entry]
+        if entries:
+            return min(entries, key=lambda n: n.call_seq).node_id
+        return min(parent_nodes.values(), key=lambda n: n.call_seq).node_id
+
+    @staticmethod
+    def _spawn_start_label(spawn_ev: dict, child_root: CallNode) -> str:
+        symbol = spawn_ev.get("start_symbol", "") or ""
+        module = spawn_ev.get("start_module", "") or ""
+        offset = spawn_ev.get("start_offset", "") or ""
+        if symbol:
+            return symbol
+        if module and module != "unknown" and offset:
+            return "{}!{}".format(module, offset)
+        return child_root.label()
 
 
 # ============================================================
 # LayoutWorker
 # ============================================================
+
+def calc_node_height(n: "CallNode", all_nodes: dict[str, "CallNode"]) -> int:
+    """NodeItem._calc_height()와 동일한 높이 계산 (레이아웃 공유)."""
+    lines = 3  # 함수명 + 주소 + 구분선
+    if n.is_external:
+        lines += 1
+    vis_ch = ordered_child_ids(n, all_nodes)
+    if vis_ch:
+        lines += len(vis_ch) + 1
+    if n.spawn_tid is not None:
+        lines += 1
+    if n.spawned_by_id is not None:
+        lines += 1
+    return max(PAD * 2 + lines * LINE_H, PAD * 2 + LINE_H * 4)
+
+
+def ordered_child_ids(n: "CallNode", all_nodes: dict[str, "CallNode"]) -> list[str]:
+    """부모 내부 목록과 scene edge가 공유하는 하위 호출 순서."""
+    child_ids = [cid for cid in n.children_ids if cid in all_nodes]
+    return sorted(child_ids, key=lambda cid: all_nodes[cid].call_seq)
+
+
+def child_row_anchor_y(n: "CallNode", all_nodes: dict[str, "CallNode"],
+                       child_id: str) -> Optional[float]:
+    """NodeItem.paint()의 하위 항목 줄 중앙 y와 같은 값을 반환."""
+    children = ordered_child_ids(n, all_nodes)
+    if child_id not in children:
+        return None
+    y = PAD
+    if n.is_external:
+        y += LINE_H
+    y += LINE_H  # 함수명
+    y += LINE_H  # 주소
+    y += 6       # 구분선 여백
+    y += LINE_H  # "하위/다음" 헤더
+    return y + children.index(child_id) * LINE_H + LINE_H / 2.0
+
 
 class LayoutWorker:
     def __init__(self, nodes: dict[str, CallNode],
@@ -483,34 +758,99 @@ class LayoutWorker:
         self._visible = visible
 
     def _compute(self) -> dict[str, tuple[float, float]]:
+        # 현재 레이아웃 구현:
+        #   - _visible_nodes()가 넘긴 실제 scene 노드를 배치한다.
+        #   - parent_id/children_ids 트리를 기준으로 depth별 컬럼을 만들고,
+        #     부모는 보이는 자식 서브트리의 수직 중앙에 둔다.
+        #
+        # 이 작업 이후 의도한 레이아웃:
+        #   - 부모 카드 내부 하위 항목과 scene에 존재하는 child 노드의
+        #     개념을 분리하지 않는다. 목록에 있는 child는 실제 scene 노드다.
+        #   - edge는 부모 내부의 해당 하위 항목 줄에서 시작한다.
+        #   - 하위 항목 줄 순서는 호출 순서(call_seq)이며, 이 순서가 edge
+        #     anchor와 오른쪽 child 배치 순서를 함께 결정한다.
+        #
+        # 남은 차이:
+        #   - child 노드의 y 좌표는 아직 서브트리 중심 정렬을 따른다.
+        #     edge 시작점은 줄 anchor와 정확히 맞지만, 도착 노드 중심은
+        #     전체 서브트리 충돌 회피를 위해 별도로 배치된다.
         vis = {nid: n for nid, n in self._nodes.items()
                if nid in self._visible}
         if not vis:
             return {}
 
-        positions: dict[str, tuple[float, float]] = {}
-        row_h = max(self._node_h(), 260) + V_GAP
         col_w = NODE_W + H_GAP
-        col_cache: dict[str, int] = {}
+        positions: dict[str, tuple[float, float]] = {}
 
-        def visible_depth(node: CallNode) -> int:
-            if node.node_id in col_cache:
-                return col_cache[node.node_id]
-            if node.parent_id and node.parent_id in vis:
-                d = visible_depth(vis[node.parent_id]) + 1
-            else:
-                d = 0
-            col_cache[node.node_id] = d
-            return d
+        # subtree_height: nid를 루트로 하는 서브트리 전체의 y 높이 (자식 포함)
+        # 메모이제이션으로 중복 계산 방지
+        _cache: dict[str, float] = {}
 
-        for idx, n in enumerate(sorted(vis.values(), key=lambda x: x.call_seq)):
-            positions[n.node_id] = (visible_depth(n) * col_w, idx * row_h)
+        def subtree_height(nid: str) -> float:
+            if nid in _cache:
+                return _cache[nid]
+            n = vis.get(nid)
+            if not n:
+                _cache[nid] = 0.0
+                return 0.0
+            h = float(calc_node_height(n, self._nodes) + V_GAP)
+            children = ordered_child_ids(n, vis)
+            if children:
+                ch_total = sum(subtree_height(c) for c in children)
+                h = max(h, ch_total)
+            _cache[nid] = h
+            return h
+
+        # place: 서브트리를 (depth, top_y) 기준으로 배치.
+        # 부모 노드는 자식 서브트리 전체의 수직 중앙에 위치.
+        def place(nid: str, depth: int, top_y: float):
+            n = vis.get(nid)
+            if not n:
+                return
+            children = ordered_child_ids(n, vis)
+
+            node_h = calc_node_height(n, self._nodes)
+
+            if not children:
+                positions[nid] = (depth * col_w, top_y)
+                return
+
+            # 자식들을 depth+1 컬럼에 순서대로 배치
+            child_y = top_y
+            for cid in children:
+                place(cid, depth + 1, child_y)
+                child_y += subtree_height(cid)
+
+            # 부모를 자식 블록의 수직 중앙에 배치
+            total_children_h = child_y - top_y
+            parent_y = top_y + (total_children_h - node_h) / 2.0
+            positions[nid] = (depth * col_w, parent_y)
+
+        # 최상위 루트들을 순서대로 배치
+        roots = [n for n in vis.values()
+                 if n.parent_id is None or n.parent_id not in vis]
+        if not roots:
+            # parent_id가 꼬이거나 cycle이 있으면 루트가 0개가 되어 탭이 빈
+            # 화면처럼 보인다. 이 경우에도 모든 노드를 독립 root로 배치한다.
+            roots = list(vis.values())
+        roots.sort(key=lambda n: n.call_seq)
+
+        cur_y = 0.0
+        for root in roots:
+            if root.node_id in positions:
+                continue
+            place(root.node_id, 0, cur_y)
+            cur_y += subtree_height(root.node_id)
+
+        # 그래도 배치되지 않은 노드는 독립 노드로 세로 배치한다.
+        # partially broken trace라도 탭 내부에 내용은 반드시 보여야 한다.
+        for n in sorted(vis.values(), key=lambda n: n.call_seq):
+            if n.node_id in positions:
+                continue
+            positions[n.node_id] = (0, cur_y)
+            cur_y += calc_node_height(n, self._nodes) + V_GAP
 
         return positions
-
-    def _node_h(self) -> int:
-        """NodeItem._calc_height()와 반드시 일치해야 함."""
-        return PAD * 2 + LINE_H * 10
 
 
 # ============================================================
@@ -533,8 +873,12 @@ class NodeItem(QGraphicsItem):
         self._searched = False
         self._toggle_hotspots: list[tuple[QRectF, str]] = []
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        # 디버깅용: 레이아웃/edge anchor 문제를 눈으로 확인하기 위해
+        # 노드를 직접 끌어 옮길 수 있게 한다. 이동하면 itemChange()에서
+        # 연결선을 즉시 다시 계산한다.
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setAcceptHoverEvents(True)
-        self._h = self._calc_height()
 
     def type(self): return self.Type
 
@@ -546,38 +890,29 @@ class NodeItem(QGraphicsItem):
         self.update()
 
     def _calc_height(self) -> int:
-        """LayoutWorker._node_h()와 기준값 공유 (LINE_H * 10 최소)."""
-        lines = 3  # 함수명 + 주소 + 구분선 여백
-        n = self._node
-        if n.args:
-            lines += 5
-        if n.retval:
-            lines += 2
-        vis_ch = [c for c in n.children_ids if c in self._nodes]
-        if vis_ch:
-            lines += min(len(vis_ch), 5) + 1
-        if n.spawn_tid is not None:
-            lines += 1
-        return max(PAD * 2 + lines * LINE_H, PAD * 2 + LINE_H * 10)
+        return calc_node_height(self._node, self._nodes)
 
     def boundingRect(self) -> QRectF:
-        return QRectF(0, 0, NODE_W, self._h)
+        return QRectF(0, 0, NODE_W, self._calc_height())
 
     def paint(self, painter: QPainter, option, widget=None):
         n = self._node
-        w, h = NODE_W, self._h
+        h = self._calc_height()
+        w = NODE_W
         sel = self.isSelected()
         self._toggle_hotspots = []
 
         # 배경색
-        if n.is_entry:  bg = C_NODE_ENTRY
-        elif n.is_exit: bg = C_NODE_EXIT
-        else:           bg = C_NODE_BG
+        if n.is_entry:       bg = C_NODE_ENTRY
+        elif n.is_exit:      bg = C_NODE_EXIT
+        elif n.is_external:  bg = C_NODE_EXTERNAL
+        else:                bg = C_NODE_BG
 
         # 테두리
-        if sel:              border, bw = C_NODE_SEL,    2
-        elif self._searched: border, bw = C_NODE_SEARCH, 2
-        else:                border, bw = C_NODE_BORDER, 1
+        if sel:              border, bw = C_NODE_SEL,       2
+        elif self._searched: border, bw = C_NODE_SEARCH,    2
+        elif n.is_external:  border, bw = C_NODE_BORDER_EXT,1
+        else:                border, bw = C_NODE_BORDER,    1
 
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setBrush(QBrush(bg))
@@ -587,10 +922,21 @@ class NodeItem(QGraphicsItem):
         y = PAD
         x = PAD
 
+        # 외부 모듈 배지 (함수명 위)
+        if n.is_external and n.module and not n.module.startswith("["):
+            painter.setFont(FONT_SUB)
+            painter.setPen(QPen(C_TEXT_EXT_MOD))
+            mod_lbl = "[ {} ]".format(n.module)
+            if len(mod_lbl) > 34:
+                mod_lbl = mod_lbl[:31] + "…]"
+            painter.drawText(x, y + LINE_H - 2, mod_lbl)
+            y += LINE_H
+
         # 함수명
         painter.setFont(FONT_MAIN)
         painter.setPen(QPen(C_TEXT_FUNC))
-        lbl = n.label()
+        lbl = n.symbol if n.symbol else (
+            "+{}".format(hex(n.offset)) if n.is_external else n.label())
         if len(lbl) > 32: lbl = lbl[:29] + "…"
         painter.drawText(x, y + LINE_H - 2, lbl)
         y += LINE_H
@@ -606,38 +952,19 @@ class NodeItem(QGraphicsItem):
         painter.drawLine(PAD, y + 2, w - PAD, y + 2)
         y += 6
 
-        # 인자
-        if n.args:
-            painter.setFont(FONT_SUB)
-            painter.setPen(QPen(C_TEXT_SUB))
-            painter.drawText(x, y + LINE_H - 2, "args:")
-            y += LINE_H
-            painter.setFont(FONT_ADDR)
-            painter.setPen(QPen(C_TEXT_ARG))
-            regs = ("arg0", "arg1", "arg2", "arg3")
-            if n.args.get("arch") != "ia32":
-                regs = ("rcx", "rdx", "r8", "r9")
-            for idx, reg in enumerate(("rcx", "rdx", "r8", "r9")):
-                val = n.args.get(reg, "")
-                if val:
-                    txt = "  {}={}".format(regs[idx], val[:20])
-                    painter.drawText(x, y + LINE_H - 2, txt)
-                    y += LINE_H
-
-        # 반환값
-        if n.retval:
-            painter.setFont(FONT_SUB)
-            painter.setPen(QPen(C_TEXT_SUB))
-            painter.drawText(x, y + LINE_H - 2, "ret:")
-            y += LINE_H
-            painter.setFont(FONT_ADDR)
-            painter.setPen(QPen(C_TEXT_RET))
-            painter.drawText(x + 4, y + LINE_H - 2,
-                             "  rax={}".format(n.retval[:24]))
-            y += LINE_H
-
         # 하위 호출 목록 (1단계)
-        vis_ch = [c for c in n.children_ids if c in self._nodes]
+        # 현재 구현:
+        #   - 부모 카드 안의 각 하위 항목은 실제 scene에 존재하는 child 노드와
+        #     같은 개념이다. 텍스트 목록만 있고 실제 노드가 없는 상태를 만들지 않는다.
+        #   - 하위 항목 순서는 호출 순서(call_seq)이며 EdgeItem.refresh()도
+        #     같은 순서와 같은 y 좌표 계산을 사용한다.
+        #
+        # 원래 작동해야 하는 방식:
+        #   - 이 목록의 각 줄이 개별 anchor가 된다.
+        #   - 특정 줄을 클릭하면 해당 child 노드로 focus/expand 동작이 이어진다.
+        #   - edge는 아래 EdgeItem.refresh()에서 이 줄의 y 좌표를 그대로
+        #     사용해 시작해야 한다.
+        vis_ch = ordered_child_ids(n, self._nodes)
         if vis_ch:
             painter.setFont(FONT_SUB)
             painter.setPen(QPen(C_TEXT_SUB))
@@ -647,9 +974,8 @@ class NodeItem(QGraphicsItem):
             painter.drawText(x, y + LINE_H - 2,
                              "하위/다음({}) {}".format(len(vis_ch), state))
             y += LINE_H
-            shown = vis_ch[:5]
             painter.setFont(FONT_ADDR)
-            for cid in shown:
+            for cid in vis_ch:
                 cn = self._nodes.get(cid)
                 if not cn: continue
                 arrow = "v" if cn.expanded else ">"
@@ -662,20 +988,52 @@ class NodeItem(QGraphicsItem):
                 if len(cl) > 30: cl = cl[:27] + "…"
                 painter.drawText(x + 20, y + LINE_H - 2, cl)
                 y += LINE_H
-            if len(vis_ch) > 5:
-                painter.setPen(QPen(C_TEXT_SUB))
-                painter.drawText(x + 6, y + LINE_H - 2,
-                                 "  … +{}".format(len(vis_ch) - 5))
 
-        # spawn 링크
+        # spawn 링크 (스레드 생성) — 부모 노드에 표시
+        footer_y = h - PAD
         if n.spawn_tid is not None:
             painter.setFont(FONT_SUB)
             painter.setPen(QPen(C_EDGE_SPAWN))
-            painter.drawText(x, h - PAD - 2,
-                             "→ Thread {}".format(n.spawn_tid))
+            sym = n.spawn_start_sym
+            if sym and len(sym) > 22:
+                sym = sym[:19] + "…"
+            spawn_lbl = "⤷ Thread {} 생성".format(n.spawn_tid)
+            if sym:
+                spawn_lbl += "  {}".format(sym)
+            self._toggle_hotspots.append(
+                (QRectF(x, footer_y - LINE_H, w - PAD * 2, LINE_H),
+                 "__spawn__:{}".format(n.spawn_tid)))
+            painter.drawText(x, footer_y - 2, spawn_lbl)
+            footer_y -= LINE_H
+
+        # spawned by 링크 — 자식 스레드 루트 노드에 표시
+        if n.spawned_by_id is not None and n.spawned_by_tid is not None:
+            painter.setFont(FONT_SUB)
+            painter.setPen(QPen(C_EDGE_SPAWN))
+            parent_node = self._nodes.get(n.spawned_by_id)
+            pname = parent_node.label() if parent_node else n.spawned_by_label
+            if pname:
+                if len(pname) > 20: pname = pname[:17] + "…"
+                by_lbl = "⤴ Thread {} 에서 생성  {}".format(n.spawned_by_tid, pname)
+            else:
+                by_lbl = "⤴ Thread {} 에서 생성".format(n.spawned_by_tid)
+            start_lbl = n.spawn_start_label
+            if start_lbl and start_lbl != n.label():
+                if len(start_lbl) > 18: start_lbl = start_lbl[:15] + "…"
+                by_lbl += " -> {}".format(start_lbl)
+            self._toggle_hotspots.append(
+                (QRectF(x, footer_y - LINE_H, w - PAD * 2, LINE_H),
+                 "__spawned_by__:{}".format(n.spawned_by_tid)))
+            painter.drawText(x, footer_y - 2, by_lbl)
 
     def mouseDoubleClickEvent(self, event):
         if self.on_activated_cb:
+            pos = event.position() if hasattr(event, "position") else event.pos()
+            for rect, token in self._toggle_hotspots:
+                if rect.contains(pos):
+                    self.on_activated_cb(token)
+                    event.accept()
+                    return
             self.on_activated_cb(self._node.node_id)
             event.accept()
             return
@@ -683,13 +1041,20 @@ class NodeItem(QGraphicsItem):
 
     def mousePressEvent(self, event):
         pos = event.position() if hasattr(event, "position") else event.pos()
-        for rect, node_id in self._toggle_hotspots:
+        for rect, token in self._toggle_hotspots:
             if rect.contains(pos):
-                target = self._nodes.get(node_id)
+                if token.startswith("__spawn__:") or token.startswith("__spawned_by__:"):
+                    if self.on_activated_cb:
+                        self.on_activated_cb(token)
+                    event.accept()
+                    return
+                target = self._nodes.get(token)
                 if target:
-                    if node_id != self._node.node_id:
+                    if token != self._node.node_id:
                         self._node.expanded = True
                     target.expanded = not target.expanded
+                    # boundingRect 크기가 변할 수 있으므로 알림
+                    self.prepareGeometryChange()
                     self.update()
                     if self.on_toggle_cb:
                         self.on_toggle_cb(target.node_id)
@@ -759,17 +1124,20 @@ class EdgeItem(QGraphicsPathItem):
         dp = self._dst.pos()
 
         # 좌→우 호출 흐름. 부모의 자식 호출 순서별 고정 앵커에서 시작한다.
+        # 현재 구현:
+        #   - 부모 내부 하위 항목 줄의 실제 y 좌표를 child_row_anchor_y()로
+        #     계산하고, edge 시작점을 그 줄 중앙에 맞춘다.
+        #
+        # 원래 작동해야 하는 방식:
+        #   - 하위 호출 순서가 곧 목록 줄 순서다.
+        #   - 해당 순서의 줄에서 해당 child node로 선이 나가야 호출 순서를
+        #     눈으로 따라갈 수 있다.
         sx = sp.x() + sr.width()
         sy = sp.y() + sr.height() / 2.0
-        children = [
-            cid for cid in self._src.node.children_ids
-            if cid in self._src._nodes
-        ]
-        children.sort(key=lambda cid: self._src._nodes[cid].call_seq)
-        if self._edge.dst_id in children:
-            rank = children.index(self._edge.dst_id)
-            spacing = max(12.0, (sr.height() - PAD * 2) / (len(children) + 1))
-            sy = sp.y() + PAD + spacing * (rank + 1)
+        anchor_y = child_row_anchor_y(
+            self._src.node, self._src._nodes, self._edge.dst_id)
+        if anchor_y is not None:
+            sy = sp.y() + anchor_y
         dx = dp.x()
         dy = dp.y() + dr.height() / 2.0
         mid_x = (sx + dx) / 2.0
@@ -861,6 +1229,9 @@ class GraphScene(QGraphicsScene):
         finally:
             self.applying_positions = False
             self.edges_update()
+            br = self.itemsBoundingRect()
+            if not br.isEmpty():
+                self.setSceneRect(br.adjusted(-80, -80, 80, 80))
             self.update()
 
     def edges_update(self):
@@ -1038,6 +1409,8 @@ class CallGraphPanel(QWidget):
         self._rendered_tids: set[int] = set()
         self._fit_pending_tids: set[int] = set()
         self._pending_focus: dict[int, str] = {}
+        self._tab_tids: list[int] = []
+        self._project_files: list[str] = []
 
         ly = QVBoxLayout(self)
         ly.setContentsMargins(0, 0, 0, 0)
@@ -1074,6 +1447,8 @@ class CallGraphPanel(QWidget):
 
         # 스레드 탭
         self._tabs = QTabWidget()
+        self._tabs.setUsesScrollButtons(True)
+        self._tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self._tabs.setStyleSheet("""
             QTabWidget::pane{border:1px solid #D1D9E0;background:#F5F5F5;}
             QTabBar::tab{background:#EEF2F7;color:#6B7280;
@@ -1099,29 +1474,44 @@ class CallGraphPanel(QWidget):
 
     def load_session(self, session):
         """TraceSession 수신 시 호출."""
-        self._placeholder.hide()
-        self._tabs.show()
-
-        builder = CallTreeBuilder(self._symbol_resolver)
-        self._session_data = builder.build(session)
+        builder = CallTreeBuilder(self._symbol_resolver, self._project_files)
+        try:
+            self._session_data = builder.build(session)
+        except Exception as e:
+            dbg("graph build failed: {!r}".format(e))
+            self._session_data = {}
         self._rendered_tids = set()
         self._fit_pending_tids = set()
         self._apply_initial_expansion()
 
         self._tabs.clear()
         self._views.clear()
+        self._tab_tids = []
+
+        if not self._session_data:
+            self._tabs.hide()
+            self._placeholder.setText(
+                "트레이스 데이터가 없습니다.\n"
+                "사용자 입력 이후 실행되는 함수라면 해당 동작을 수행한 뒤 종료하세요.")
+            self._placeholder.show()
+            return
+
+        self._placeholder.hide()
+        self._tabs.show()
 
         for tid in sorted(self._session_data.keys()):
             self._add_tab(tid)
 
         if self._session_data:
-            main_tid = sorted(self._session_data.keys())[0]
+            main_tid = self._main_tid()
             self._current_tid = main_tid
             self._relayout(main_tid)
+            self._switch_to_tid(main_tid)
 
     def _apply_initial_expansion(self):
-        for _tid, (nodes, _) in self._session_data.items():
-            for n in nodes.values():
+        """모든 노드 기본 접힘 상태. 클릭 시 오른쪽에 자식이 펼쳐짐."""
+        for n_map, _ in self._session_data.values():
+            for n in n_map.values():
                 n.expanded = False
 
     def _terminal_node(self, nodes: dict[str, CallNode]) -> Optional[CallNode]:
@@ -1131,6 +1521,15 @@ class CallGraphPanel(QWidget):
         if exits:
             return max(exits, key=lambda n: n.call_seq)
         return max(nodes.values(), key=lambda n: n.call_seq)
+
+    def _main_tid(self) -> int:
+        # 현재 정책: 프로세스 생성 직후 가장 먼저 만들어진 스레드를 main으로 본다.
+        # Windows에서는 일반적으로 메인 스레드가 가장 작은 TID를 가진다.
+        #
+        # 이전 구현은 "첫 trace_seq가 가장 작은 스레드"를 main으로 표시했다.
+        # 그러나 Stalker attach/스케줄링 순서 때문에 실제 main보다 늦게 생성된
+        # 스레드가 먼저 이벤트를 낼 수 있어, main 탭 표시가 흔들린다.
+        return min(self._session_data.keys())
 
     def sync_from_ghidra(self, module: str, offset_hex: str):
         """Ghidra sync → 해당 노드 선택."""
@@ -1190,6 +1589,9 @@ class CallGraphPanel(QWidget):
     def set_symbol_resolver(self, resolver):
         self._symbol_resolver = resolver
 
+    def set_project_files(self, files: list[str]):
+        self._project_files = list(files)
+
     # ── 탭 ──────────────────────────────────────────────────
 
     def _add_tab(self, tid: int):
@@ -1198,14 +1600,13 @@ class CallGraphPanel(QWidget):
         scene.node_selected.connect(
             lambda nid, t=tid: self._on_node_signal(t, nid))
         self._views[tid] = (scene, view)
-        tids   = sorted(self._session_data.keys())
-        suffix = " (main)" if tid == tids[0] else ""
+        self._tab_tids.append(tid)
+        suffix = " (main)" if tid == self._main_tid() else ""
         self._tabs.addTab(view, "Thread {}{}".format(tid, suffix))
 
     def _switch_to_tid(self, tid: int):
-        tids = sorted(self._session_data.keys())
-        if tid in tids:
-            self._tabs.setCurrentIndex(tids.index(tid))
+        if tid in self._tab_tids:
+            self._tabs.setCurrentIndex(self._tab_tids.index(tid))
 
     # ── 레이아웃 ────────────────────────────────────────────
 
@@ -1216,11 +1617,22 @@ class CallGraphPanel(QWidget):
         scene, view  = self._views[tid]
 
         visible = self._visible_nodes(nodes)
-        scene.rebuild(nodes, edges, visible)
+
+        # cross-thread spawn 자식 루트 노드를 이 탭의 씬에 포함
+        extra_nodes = self._cross_thread_nodes(nodes, visible)
+        if extra_nodes:
+            combined_nodes = dict(nodes)
+            combined_nodes.update(extra_nodes)
+            combined_visible = set(visible) | set(extra_nodes.keys())
+        else:
+            combined_nodes  = nodes
+            combined_visible = visible
+
+        scene.rebuild(combined_nodes, edges, combined_visible)
         if fit:
             self._fit_pending_tids.add(tid)
 
-        positions = LayoutWorker(nodes, edges, visible)._compute()
+        positions = LayoutWorker(combined_nodes, edges, combined_visible)._compute()
         self._apply_layout(tid, scene, view, positions)
 
     def _apply_layout(self, tid: int, scene: GraphScene, view: GraphView,
@@ -1234,13 +1646,40 @@ class CallGraphPanel(QWidget):
             view.focus_on(self._pending_focus.pop(tid))
 
     def _visible_nodes(self, nodes: dict[str, CallNode]) -> set[str]:
-        visible: set[str] = set()
-        for n in nodes.values():
-            if n.parent_id is None:
-                visible.add(n.node_id)
-                if n.expanded:
-                    self._collect(n, nodes, visible)
-        return visible
+        # 현재 구현:
+        #   - 이 스레드의 모든 CallNode를 실제 QGraphicsScene 노드로 만든다.
+        #   - 따라서 부모 NodeItem 안의 하위 항목 목록과 scene에 존재하는
+        #     child 노드의 개념이 같다.
+        #   - expanded는 더 이상 "scene에 존재하는지"를 결정하지 않고,
+        #     사용자가 어떤 노드를 열어 보려 했는지 표시/상호작용 상태에 가깝다.
+        #
+        # 원래 작동해야 하는 방식:
+        #   - 모든 하위 호출은 expand/focus 가능한 실제 노드다.
+        #   - 부모 내부 목록은 실제 노드의 요약 목록일 뿐, 별도의 텍스트 전용
+        #     항목이어서는 안 된다.
+        #   - edge는 부모 내부 목록 줄 위치에서 시작해 같은 child 노드로 향한다.
+        #
+        # 디버깅 효과:
+        #   - root 판정이 잘못되어도 탭이 빈 scene으로 보이지 않는다.
+        #   - 노드 드래그를 켜 두었으므로, 호출 순서/edge anchor 문제를 직접
+        #     움직여 확인할 수 있다.
+        return set(nodes.keys())
+
+    def _cross_thread_nodes(self, nodes: dict[str, CallNode],
+                            visible: set[str]) -> dict[str, CallNode]:
+        """visible 노드 중 spawn_child를 가진 것의 자식 스레드 루트 노드 수집.
+        반환: {child_node_id: CallNode} (다른 스레드 소속)
+        """
+        extra: dict[str, CallNode] = {}
+        for nid in visible:
+            n = nodes.get(nid)
+            if not n or n.spawn_child_node_id is None or n.spawn_child_tid is None:
+                continue
+            child_nodes, _ = self._session_data.get(n.spawn_child_tid, ({}, []))
+            child_nid = n.spawn_child_node_id
+            if child_nid in child_nodes:
+                extra[child_nid] = child_nodes[child_nid]
+        return extra
 
     def _collect(self, node: CallNode,
                  nodes: dict[str, CallNode], visible: set[str]):
@@ -1256,28 +1695,60 @@ class CallGraphPanel(QWidget):
     def _on_tab_changed(self, idx: int):
         if idx < 0:
             return
-        tids = sorted(self._session_data.keys())
-        if idx < len(tids):
-            self._current_tid = tids[idx]
-            if self._current_tid not in self._rendered_tids:
+        if idx < len(self._tab_tids):
+            self._current_tid = self._tab_tids[idx]
+            scene, _ = self._views.get(self._current_tid, (None, None))
+            scene_empty = bool(scene is not None and not scene._node_items)
+            if self._current_tid not in self._rendered_tids or scene_empty:
                 self._relayout(self._current_tid)
 
     def _on_node_signal(self, tid: int, signal: str):
         """씬에서 오는 node_selected 시그널 처리."""
         if signal.startswith("__toggle__:"):
             node_id = signal[len("__toggle__:"):]
-            # expanded는 NodeItem.mouseDoubleClickEvent에서 이미 토글됨
+            # expanded는 NodeItem.mousePressEvent에서 이미 토글됨
             nodes, _ = self._session_data.get(tid, ({}, []))
             mods = self._modules_around(nodes, node_id)
             if mods:
                 self.symbol_modules_requested.emit(mods)
-            self._relayout(tid)
+            self._relayout(tid, fit=False)  # 접기/펼치기 시 뷰 위치 유지
         elif signal.startswith("__activate__:"):
-            node_id = signal[len("__activate__:"):]
-            nodes, _ = self._session_data.get(tid, ({}, []))
-            n = nodes.get(node_id)
-            if n and not n.module.startswith("["):
-                self.sync_requested.emit(n.module, hex(n.offset))
+            inner = signal[len("__activate__:"):]
+            if inner.startswith("__spawn__:"):
+                # spawn 링크 클릭 → 자식 스레드 탭으로 이동
+                try:
+                    child_tid = int(inner[len("__spawn__:"):])
+                    self._switch_to_tid(child_tid)
+                except ValueError:
+                    pass
+            elif inner.startswith("__spawned_by__:"):
+                # spawned_by 링크 클릭 → 부모 스레드 탭으로 이동
+                try:
+                    parent_tid = int(inner[len("__spawned_by__:"):])
+                    self._switch_to_tid(parent_tid)
+                except ValueError:
+                    pass
+            else:
+                node_id = inner
+                # cross-thread 노드일 수도 있으므로 전체 탭에서 검색
+                n = None
+                found_tid = tid
+                current_nodes, _ = self._session_data.get(tid, ({}, []))
+                if node_id in current_nodes:
+                    n = current_nodes[node_id]
+                else:
+                    for t, (ns, _) in self._session_data.items():
+                        if node_id in ns:
+                            n = ns[node_id]
+                            found_tid = t
+                            break
+                if n and not n.module.startswith("["):
+                    if found_tid != self._current_tid:
+                        self._switch_to_tid(found_tid)
+                    if found_tid in self._views:
+                        _, view = self._views[found_tid]
+                        view.focus_on(node_id)
+                    self.sync_requested.emit(n.module, hex(n.offset))
         else:
             return
 
@@ -1397,8 +1868,7 @@ class ModuleTimeline:
 
 def postprocess(raw_events: list[dict],
                 mod_events: list[dict]) -> list[dict]:
-    """raw VA → (module, offset). 호출 스택 복원을 위해 반복 이벤트를 보존한다."""
-    tl   = ModuleTimeline(mod_events)
+    """Frida가 Process.findModuleByAddress()로 기록한 모듈명을 우선 사용한다."""
     out:  list[dict] = []
     for ev in raw_events:
         seq    = ev["seq"]
@@ -1406,18 +1876,27 @@ def postprocess(raw_events: list[dict],
         dst_va = int(ev["dst"], 16)
         kind   = "call" if ev["k"] == 0 else "ret"
         tid    = ev["tid"]
-        sm, so = tl.resolve(src_va, seq)
-        dm, do = tl.resolve(dst_va, seq)
-        if sm == "unknown" and ev.get("src_module"):
+
+        sm = ev.get("src_module", "")
+        if sm and sm != "unknown":
             sm = ev.get("src_module", sm)
-            so = CallTreeBuilder._hex(ev.get("src_offset", hex(so)))
-        if dm == "unknown" and ev.get("dst_module"):
+            so = CallTreeBuilder._hex(ev.get("src_offset", "0x0"))
+        else:
+            sm, so = "unknown", src_va
+
+        dm = ev.get("dst_module", "")
+        if dm and dm != "unknown":
             dm = ev.get("dst_module", dm)
-            do = CallTreeBuilder._hex(ev.get("dst_offset", hex(do)))
+            do = CallTreeBuilder._hex(ev.get("dst_offset", "0x0"))
+        else:
+            dm, do = "unknown", dst_va
+
         out.append({"src_module": sm, "src_offset": hex(so),
                     "dst_module": dm, "dst_offset": hex(do),
                     "src_symbol": ev.get("src_symbol", ""),
                     "dst_symbol": ev.get("dst_symbol", ""),
+                    "dst_is_external": bool(ev.get("dst_is_external", False)),
+                    "source": ev.get("source", ""),
                     "type": kind, "thread_id": tid, "seq": seq})
     return out
 
@@ -1506,7 +1985,6 @@ class TraceSession:
         self.session_id    = str(uuid.uuid4())
         self.events:       list[dict] = []
         self.raw_events:   list[dict] = []
-        self.snapshots:    list[dict] = []
         self.mod_events:   list[dict] = []
         self.sync_events:  list[dict] = []
         self.spawn_events: list[dict] = []
@@ -1532,7 +2010,6 @@ class TraceSession:
             "session_id":   self.session_id,
             "events":       [self._event_for_save(e) for e in self.events],
             "raw_events":   self.raw_events,
-            "snapshots":    self.snapshots,
             "mod_events":   self.mod_events,
             "sync_events":  self.sync_events,
             "spawn_events": self.spawn_events,
@@ -1548,7 +2025,6 @@ class TraceSession:
         s.events       = [TraceSession._event_for_save(e)
                           for e in d.get("events", [])]
         s.raw_events   = d.get("raw_events", [])
-        s.snapshots    = d.get("snapshots", [])
         s.mod_events   = d.get("mod_events", [])
         s.sync_events  = d.get("sync_events", [])
         s.spawn_events = d.get("spawn_events", [])
@@ -1561,10 +2037,7 @@ class TraceSession:
 
     @staticmethod
     def _event_for_save(ev: dict) -> dict:
-        out = dict(ev)
-        out.pop("src_symbol", None)
-        out.pop("dst_symbol", None)
-        return out
+        return dict(ev)
 
 
 # ============================================================
@@ -1592,7 +2065,6 @@ class FridaWorker(QObject):
         self._trace_done_event = threading.Event()
         self._chunk_lock    = threading.Lock()
         self._chunk_events: list[dict] = []
-        self._chunk_snapshots: list[dict] = []
         self._chunk_mod_events: list[dict] = []
         self._chunk_sync_events: list[dict] = []
         self._chunk_spawn_events: list[dict] = []
@@ -1702,6 +2174,11 @@ class FridaWorker(QObject):
                     dbg("trace_complete wait timeout after stop rpc")
 
         if not self._done:
+            if self._has_cached_payload():
+                dbg("finalize from cached chunks after stop fallback")
+                self._done = True
+                self._trace_done_event.set()
+                self.trace_complete.emit(self._build_session("user_stop"))
             self._cleanup()
             self._finish()
 
@@ -1757,13 +2234,23 @@ class FridaWorker(QObject):
             return
         self.status_changed.emit("대상 프로세스 종료 감지")
         self._pid = None
-        if self._chunk_events or self._chunk_mod_events:
+        if self._has_cached_payload():
             dbg("finalize from cached chunks after detach")
             self._done = True
             self._trace_done_event.set()
             self.trace_complete.emit(self._build_session("detached"))
         self._cleanup()
         self._finish()
+
+    def _has_cached_payload(self) -> bool:
+        with self._chunk_lock:
+            return bool(
+                self._chunk_events
+                or self._chunk_mod_events
+                or self._chunk_sync_events
+                or self._chunk_spawn_events
+                or self._chunk_handle_events
+            )
 
     def _append_trace_payload(self, pl: dict):
         with self._chunk_lock:
@@ -1772,13 +2259,12 @@ class FridaWorker(QObject):
             if sent_at_ms is None:
                 sent_at_ms = int(time.time() * 1000)
             for key in (
-                "events", "snapshots", "mod_events", "sync_events",
+                "events", "mod_events", "sync_events",
                 "spawn_events", "handle_events"):
                 for ev in pl.get(key, []):
                     if isinstance(ev, dict) and "sent_at_ms" not in ev:
                         ev["sent_at_ms"] = sent_at_ms
             self._chunk_events.extend(pl.get("events", []))
-            self._chunk_snapshots.extend(pl.get("snapshots", []))
             self._chunk_mod_events.extend(pl.get("mod_events", []))
             self._chunk_sync_events.extend(pl.get("sync_events", []))
             self._chunk_spawn_events.extend(pl.get("spawn_events", []))
@@ -1793,7 +2279,6 @@ class FridaWorker(QObject):
     def _build_session(self, reason: str) -> TraceSession:
         with self._chunk_lock:
             raw = list(self._chunk_events)
-            snapshots = list(self._chunk_snapshots)
             mods = list(self._chunk_mod_events)
             sync_events = list(self._chunk_sync_events)
             spawn_events = list(self._chunk_spawn_events)
@@ -1808,7 +2293,6 @@ class FridaWorker(QObject):
             sess.session_id = session_id
         sess.raw_events = raw
         sess.events = evs
-        sess.snapshots = snapshots
         sess.mod_events = mods
         sess.sync_events = sync_events
         sess.spawn_events = spawn_events
@@ -2321,6 +2805,7 @@ class FunctionSearchPanel(QWidget):
         self._session = None
         self._symbol_resolver = None
         self._entries: list[dict] = []
+        self._target_modules: set[str] = set()
 
         ly = QVBoxLayout(self)
         ly.setContentsMargins(4, 4, 4, 4)
@@ -2351,12 +2836,60 @@ class FunctionSearchPanel(QWidget):
     def set_symbol_resolver(self, resolver):
         self._symbol_resolver = resolver
 
+    def set_project_files(self, files: list[str]):
+        self._target_modules = CallTreeBuilder._normalize_targets(files)
+        self._rebuild_entries()
+
     def set_session(self, session):
         self._session = session
         self._rebuild_entries()
 
     def set_graph_entries(self, entries: list[dict]):
-        self._entries = entries
+        merged = list(entries)
+        seen = {
+            (
+                str(e.get("module", "")).lower(),
+                str(e.get("offset", "")).lower(),
+                int(e.get("tid", 0)),
+                int(e.get("trace_seq", e.get("call_seq", 0))),
+            )
+            for e in merged
+        }
+        if self._session:
+            for ev in self._session.events:
+                if ev.get("type") != "call":
+                    continue
+                if not self._is_graph_event(ev):
+                    continue
+                mod = ev.get("dst_module", "")
+                off = ev.get("dst_offset", "0x0")
+                if not mod or mod == "unknown":
+                    continue
+                key = (
+                    mod.lower(), off.lower(),
+                    int(ev.get("thread_id", 0)),
+                    int(ev.get("seq", 0)),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append({
+                    "module": mod,
+                    "offset": off,
+                    "src_module": ev.get("src_module", ""),
+                    "src_offset": ev.get("src_offset", "0x0"),
+                    "src_label": ev.get("src_symbol", ""),
+                    "tid": ev.get("thread_id", 0),
+                    "node_id": "",
+                    "call_seq": ev.get("seq", 0),
+                    "trace_seq": ev.get("seq", 0),
+                    "fallback": ev.get("dst_symbol", ""),
+                    "count": 1,
+                })
+        self._entries = sorted(
+            merged, key=lambda e: (e.get("trace_seq", 0),
+                                   e.get("tid", 0),
+                                   e.get("call_seq", 0)))
         self._apply_filter()
 
     def refresh_names(self):
@@ -2372,6 +2905,8 @@ class FunctionSearchPanel(QWidget):
         for ev in self._session.events:
             if ev.get("type") != "call":
                 continue
+            if not self._is_graph_event(ev):
+                continue
             mod = ev.get("dst_module", "")
             off = ev.get("dst_offset", "0x0")
             if not mod or mod == "unknown":
@@ -2382,6 +2917,8 @@ class FunctionSearchPanel(QWidget):
         order = 0
         for ev in self._session.events:
             if ev.get("type") != "call":
+                continue
+            if not self._is_graph_event(ev):
                 continue
             mod = ev.get("dst_module", "")
             off = ev.get("dst_offset", "0x0")
@@ -2404,6 +2941,21 @@ class FunctionSearchPanel(QWidget):
             self._entries, key=lambda e: (e["trace_seq"], e["tid"], e["call_seq"]))
         self._apply_filter()
 
+    def _is_graph_event(self, ev: dict) -> bool:
+        if not self._target_modules:
+            return True
+        return (
+            self._is_target_module(ev.get("src_module", ""))
+            or self._is_target_module(ev.get("dst_module", ""))
+        )
+
+    def _is_target_module(self, module: str) -> bool:
+        if not module or module == "unknown":
+            return False
+        name = Path(str(module)).name.lower()
+        stem = name.rsplit(".", 1)[0]
+        return name in self._target_modules or stem in self._target_modules
+
     def _label_for(self, entry: dict) -> str:
         label = self._base_label_for(entry)
         if entry.get("count", 0) > 1:
@@ -2413,14 +2965,7 @@ class FunctionSearchPanel(QWidget):
         return label
 
     def _base_label_for(self, entry: dict) -> str:
-        sym = ""
-        if self._symbol_resolver:
-            try:
-                sym = self._symbol_resolver(
-                    entry["module"], entry["offset"]) or ""
-            except Exception:
-                sym = ""
-        label = sym or entry.get("fallback", "")
+        label = entry.get("fallback", "")
         if not label:
             label = "{}+{}".format(entry["module"], entry["offset"])
         return label
@@ -2632,6 +3177,8 @@ class MainWindow(QMainWindow):
     def _on_project_info(self, files: list[str]):
         self._project_files = files
         self._left.set_project_files(files)
+        self._graph.set_project_files(files)
+        self._func_panel.set_project_files(files)
         self._st("프로젝트 파일 {}개 수신".format(len(files)))
 
     def _on_graph_sync(self, module: str, offset_hex: str):
@@ -2650,6 +3197,7 @@ class MainWindow(QMainWindow):
         if self._session and self._ghidra_worker:
             self._ghidra_worker.refresh_symbols_for_module(module)
             self._graph.load_session(self._session)
+            self._func_panel.set_session(self._session)
             self._func_panel.set_graph_entries(self._graph.function_entries())
         self._graph.sync_from_ghidra(module, offset_hex)
 
@@ -2710,9 +3258,10 @@ class MainWindow(QMainWindow):
         self._left.set_tracing(False)
         self._left.update_loaded_modules(session.modules)
         self._graph.load_session(session)
+        self._func_panel.set_session(session)
         self._func_panel.set_graph_entries(self._graph.function_entries())
-        self._st("트레이스 완료  이벤트:{}  스냅샷:{}  모듈:{}".format(
-            len(session.events), len(session.snapshots), len(session.modules)))
+        self._st("트레이스 완료  이벤트:{}  모듈:{}".format(
+            len(session.events), len(session.modules)))
 
     def _refresh_ghidra_symbols(self, refresh: bool = False,
                                 reload_graph: bool = True):
@@ -2729,6 +3278,7 @@ class MainWindow(QMainWindow):
             self._graph.visible_modules(), refresh=refresh, reload_graph=False)
         if reload_graph:
             self._graph.load_session(self._session)
+            self._func_panel.set_session(self._session)
             self._func_panel.set_graph_entries(self._graph.function_entries())
         self._st("Ghidra 이름 갱신: {}개 모듈 반영".format(changed))
 
@@ -2743,6 +3293,7 @@ class MainWindow(QMainWindow):
                 changed += 1
         if reload_graph and self._session:
             self._graph.load_session(self._session)
+            self._func_panel.set_session(self._session)
             self._func_panel.set_graph_entries(self._graph.function_entries())
         return changed
 
@@ -2841,6 +3392,7 @@ class MainWindow(QMainWindow):
             self._session = sess
             self._left.update_loaded_modules(sess.modules)
             self._graph.load_session(sess)
+            self._func_panel.set_session(sess)
             self._func_panel.set_graph_entries(self._graph.function_entries())
             self._st("불러오기: {}  이벤트:{}".format(path, len(sess.events)))
         except Exception as e:

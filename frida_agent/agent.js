@@ -1,5 +1,5 @@
 📦
-24732 /agent.js
+25467 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -21,33 +21,33 @@ var require_agent = __commonJS({
   "agent.ts"() {
     init_node_globals();
     var g_events = [];
-    var g_snapshots = [];
     var g_mod_events = [];
     var g_sync_events = [];
     var g_spawn_events = [];
     var g_handle_events = [];
     var g_stalked = /* @__PURE__ */ new Set();
     var g_attach_failed = /* @__PURE__ */ new Set();
-    var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_seq = 0;
     var g_flushed = false;
     var g_started = false;
     var g_status_timer = null;
     var g_thread_api = null;
     var g_sent_events = 0;
-    var g_sent_snapshots = 0;
     var g_sent_mod_events = 0;
     var g_sent_sync_events = 0;
     var g_sent_spawn_events = 0;
     var g_sent_handle_events = 0;
     var g_handle_gen_by_key = /* @__PURE__ */ new Map();
     var g_next_handle_gen = 1;
+    var g_symbol_name_by_va = /* @__PURE__ */ new Map();
+    var g_hooked_target_exports = /* @__PURE__ */ new Set();
+    var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
+    var g_export_symbols_by_module = /* @__PURE__ */ new Map();
     var g_targets = /* @__PURE__ */ new Set();
     var SESSION_ID = generateUUID();
     var MAX_BT = 24;
-    var LAST_EXTERNAL_CALL_TTL_MS = 1e3;
-    var ENABLE_ARG_SNAPSHOTS = false;
     var FAILURE_SCAN_DELAY_MS = 50;
+    var LAST_EXTERNAL_CALL_TTL_MS = 1500;
     function generateUUID() {
       return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
         const r = Math.random() * 16 | 0;
@@ -85,10 +85,15 @@ var require_agent = __commonJS({
       g_handle_events.push(ev);
       return gen;
     }
+    function normalizedTargetName(name) {
+      const raw = (name || "").toLowerCase().replace(/\\/g, "/");
+      const parts = raw.split("/");
+      return parts[parts.length - 1] || raw;
+    }
     function isTarget(mod) {
       if (!mod)
         return false;
-      return g_targets.has(mod.name.toLowerCase());
+      return g_targets.has(normalizedTargetName(mod.name));
     }
     function moduleOffset(addr, mod) {
       if (!mod)
@@ -96,46 +101,56 @@ var require_agent = __commonJS({
       return "0x" + addr.sub(mod.base).toString(16).toUpperCase();
     }
     function symbolName(addr) {
+      const key = ph(addr);
+      const cached = g_symbol_name_by_va.get(key);
+      if (cached !== void 0)
+        return cached;
+      let name = "";
       try {
         const sym = DebugSymbol.fromAddress(addr);
-        return sym && sym.name ? sym.name : "";
+        if (sym && sym.name)
+          name = sym.name;
       } catch (_) {
+      }
+      if (!name)
+        name = exportSymbolName(addr);
+      g_symbol_name_by_va.set(key, name);
+      return name;
+    }
+    function exportSymbolName(addr) {
+      const mod = findModuleSafe(addr);
+      if (!mod)
         return "";
+      const key = mod.name.toLowerCase();
+      let symbols = g_export_symbols_by_module.get(key);
+      if (!symbols) {
+        symbols = [];
+        try {
+          for (const ex of mod.enumerateExports()) {
+            if (ex.type === "function") {
+              symbols.push({ name: ex.name, address: ex.address });
+            }
+          }
+        } catch (_) {
+        }
+        symbols.sort((a, b) => a.address.compare(b.address));
+        g_export_symbols_by_module.set(key, symbols);
       }
-    }
-    function asNativePointer(value) {
-      if (value === null || value === void 0)
-        return null;
-      try {
-        if (typeof value === "number")
-          return ptr("0x" + value.toString(16));
-        if (typeof value === "string")
-          return ptr(value);
-        const s = value.toString;
-        if (typeof s === "function")
-          return ptr(s.call(value));
-      } catch (_) {
-        return null;
+      let best = null;
+      for (const sym of symbols) {
+        if (sym.address.compare(addr) > 0)
+          break;
+        best = sym;
       }
-      return null;
-    }
-    function numberFromAny(value) {
-      if (value === null || value === void 0)
-        return null;
-      if (typeof value === "number")
-        return value;
-      if (typeof value === "string") {
-        const s = value.trim();
-        const n = s.startsWith("0x") || s.startsWith("-0x") ? parseInt(s, 16) : parseInt(s, 10);
-        return Number.isFinite(n) ? n : null;
+      if (!best)
+        return "";
+      const delta = addr.sub(best.address).toInt32();
+      if (delta === 0)
+        return best.name;
+      if (delta > 0 && delta < 8192) {
+        return best.name + "+0x" + delta.toString(16).toUpperCase();
       }
-      try {
-        const s = value.toString;
-        if (typeof s === "function")
-          return numberFromAny(s.call(value));
-      } catch (_) {
-      }
-      return null;
+      return "";
     }
     function findModuleSafe(addr) {
       if (!addr)
@@ -144,6 +159,172 @@ var require_agent = __commonJS({
         return Process.findModuleByAddress(addr);
       } catch (_) {
         return null;
+      }
+    }
+    function pointerDetails(va) {
+      if (!va || va === "unknown") {
+        return { module: "unknown", offset: "0x0", symbol: "" };
+      }
+      try {
+        const p = ptr(va);
+        const mod = findModuleSafe(p);
+        return {
+          module: mod ? mod.name : "unknown",
+          offset: moduleOffset(p, mod),
+          symbol: symbolName(p)
+        };
+      } catch (_) {
+        return { module: "unknown", offset: "0x0", symbol: "" };
+      }
+    }
+    function noteExternalBoundaryCall(tid, loc, target, dstMod) {
+      if (!dstMod)
+        return;
+      g_last_external_call_by_tid.set(tid, {
+        caller_va: ph(loc),
+        target_va: ph(target),
+        target_module: dstMod.name,
+        at_ms: Date.now()
+      });
+    }
+    function recordTraceEvent(kind, loc, target, tid, source) {
+      const srcMod = findModuleSafe(loc);
+      const dstMod = findModuleSafe(target);
+      const isCall = kind === "call";
+      const dstIsExternal = isCall && isTarget(srcMod) && dstMod !== null && !isTarget(dstMod);
+      const out = {
+        k: isCall ? 0 : 1,
+        src: ph(loc),
+        dst: ph(target),
+        tid,
+        seq: nextSeq(),
+        src_module: srcMod ? srcMod.name : "unknown",
+        src_offset: moduleOffset(loc, srcMod),
+        dst_module: dstMod ? dstMod.name : "unknown",
+        dst_offset: moduleOffset(target, dstMod),
+        dst_is_external: dstIsExternal,
+        source
+      };
+      if (isCall || isTarget(srcMod) || isTarget(dstMod)) {
+        out.src_symbol = symbolName(loc);
+        out.dst_symbol = symbolName(target);
+      }
+      g_events.push(out);
+      if (dstIsExternal) {
+        noteExternalBoundaryCall(tid, loc, target, dstMod);
+      }
+    }
+    function hookTargetExports(mod) {
+      if (!isTarget(mod))
+        return;
+      let hooked = 0;
+      let failed = 0;
+      let exports2 = [];
+      try {
+        exports2 = mod.enumerateExports();
+      } catch (_) {
+        return;
+      }
+      for (const ex of exports2) {
+        if (ex.type !== "function")
+          continue;
+        const key = normalizedTargetName(mod.name) + "!" + ex.name + "@" + ph(ex.address);
+        if (g_hooked_target_exports.has(key))
+          continue;
+        g_hooked_target_exports.add(key);
+        try {
+          Interceptor.attach(ex.address, {
+            onEnter(_) {
+              const tid = Process.getCurrentThreadId();
+              const ra = this.returnAddress;
+              const tailTarget = detectVtableTailJump(ex.address, this.context);
+              this._fd_tid = tid;
+              this._fd_ra = ra;
+              this._fd_tail_target = tailTarget;
+              this._fd_tail_site = tailTarget ? tailJumpSite(ex.address) : null;
+              recordTraceEvent("call", ra, ex.address, tid, "target_export");
+              if (tailTarget) {
+                recordTraceEvent("call", tailJumpSite(ex.address), tailTarget, tid, "target_export_tail_jump");
+              }
+            },
+            onLeave(_) {
+              const tid = this._fd_tid || Process.getCurrentThreadId();
+              const ra = this._fd_ra;
+              const tailTarget = this._fd_tail_target;
+              const tailSite = this._fd_tail_site;
+              if (tailTarget && tailSite) {
+                recordTraceEvent("ret", tailTarget, tailSite, tid, "target_export_tail_jump");
+              }
+              if (ra)
+                recordTraceEvent("ret", ex.address, ra, tid, "target_export");
+            }
+          });
+          hooked++;
+        } catch (_) {
+          failed++;
+        }
+      }
+      if (hooked > 0 || failed > 0) {
+        send({
+          type: "status",
+          text: "target_export_hooks module=" + mod.name + " hooked=" + hooked + " failed=" + failed
+        });
+      }
+    }
+    function tailJumpSite(entry) {
+      return entry.add(6);
+    }
+    function detectVtableTailJump(entry, ctx) {
+      if (Process.arch !== "x64")
+        return null;
+      let disp = -1;
+      try {
+        if (entry.readU8() !== 72)
+          return null;
+        if (entry.add(1).readU8() !== 139)
+          return null;
+        if (entry.add(2).readU8() !== 9)
+          return null;
+        if (entry.add(3).readU8() !== 72)
+          return null;
+        if (entry.add(4).readU8() !== 139)
+          return null;
+        if (entry.add(5).readU8() !== 1)
+          return null;
+        if (entry.add(6).readU8() !== 72)
+          return null;
+        if (entry.add(7).readU8() !== 255)
+          return null;
+        if (entry.add(8).readU8() !== 96)
+          return null;
+        disp = entry.add(9).readU8();
+      } catch (_) {
+        return null;
+      }
+      try {
+        const x64 = ctx;
+        const thisPtr = x64.rcx;
+        if (!thisPtr || thisPtr.isNull())
+          return null;
+        const implThis = thisPtr.readPointer();
+        if (implThis.isNull())
+          return null;
+        const vtable = implThis.readPointer();
+        if (vtable.isNull())
+          return null;
+        const target = vtable.add(disp).readPointer();
+        if (target.isNull())
+          return null;
+        if (!findModuleSafe(target))
+          return null;
+        return target;
+      } catch (_) {
+        return null;
+      }
+    }
+    function hookLoadedTargetExports() {
+      for (const mod of Process.enumerateModules()) {
+        hookTargetExports(mod);
       }
     }
     function findTargetCaller(ctx, immediateReturn) {
@@ -171,145 +352,15 @@ var require_agent = __commonJS({
       }
       return "unknown";
     }
-    function noteExternalCall(caller, target) {
-      const targetMod = findModuleSafe(target);
-      g_last_external_call_by_tid.set(Process.getCurrentThreadId(), {
-        caller_va: ph(caller),
-        target_va: ph(target),
-        target_module: targetMod ? targetMod.name.toLowerCase() : "unknown",
-        at_ms: Date.now()
-      });
-    }
-    function consumeRecentExternalCaller(ctx, immediateReturn) {
+    function findThreadCreator(ctx, immediateReturn) {
       const tid = Process.getCurrentThreadId();
       const last = g_last_external_call_by_tid.get(tid);
-      if (last && Date.now() - last.at_ms <= LAST_EXTERNAL_CALL_TTL_MS) {
+      const lastMod = last ? last.target_module.toLowerCase() : "";
+      const looksLikeThreadApi = lastMod === "ntdll.dll" || lastMod === "kernel32.dll" || lastMod === "kernelbase.dll";
+      if (last && looksLikeThreadApi && Date.now() - last.at_ms <= LAST_EXTERNAL_CALL_TTL_MS) {
         return last.caller_va;
       }
       return findTargetCaller(ctx, immediateReturn);
-    }
-    function directCallTarget(instr) {
-      const i = instr;
-      const operands = i.operands || [];
-      if (operands.length > 0) {
-        const op = operands[0];
-        const value = op.value;
-        if ((op.type === "imm" || op.type === "immediate") && value !== void 0) {
-          return asNativePointer(value);
-        }
-      }
-      const opStr = String(i.opStr || "");
-      if (opStr.indexOf("[") >= 0)
-        return null;
-      const m = opStr.match(/0x[0-9a-fA-F]+/);
-      if (!m)
-        return null;
-      try {
-        return ptr(m[0]);
-      } catch (_) {
-        return null;
-      }
-    }
-    function readPointerSafe(addr) {
-      if (!addr)
-        return null;
-      try {
-        const p = addr.readPointer();
-        return p.isNull() ? null : p;
-      } catch (_) {
-        return null;
-      }
-    }
-    function memoryCallTarget(instr) {
-      const i = instr;
-      const src = asNativePointer(i.address);
-      if (!src)
-        return null;
-      const operands = i.operands || [];
-      if (operands.length > 0) {
-        const op = operands[0];
-        if (op && (op.type === "mem" || op.type === "memory")) {
-          const value = op.value || op.mem || {};
-          const base = String(value.base || "").toLowerCase();
-          const disp = numberFromAny(value.disp ?? value.displacement);
-          if (Process.arch === "x64" && base === "rip" && disp !== null) {
-            const next = asNativePointer(i.next) || src.add(i.size || 0);
-            return readPointerSafe(next.add(disp));
-          }
-          if ((!base || base === "0" || base === "invalid") && disp !== null) {
-            return readPointerSafe(ptr("0x" + disp.toString(16)));
-          }
-        }
-      }
-      const opStr = String(i.opStr || "");
-      const rip = opStr.match(/\[\s*rip\s*([+-])\s*(0x[0-9a-fA-F]+|\d+)\s*\]/i);
-      if (rip) {
-        const raw = numberFromAny(rip[2] || "");
-        if (raw !== null) {
-          const disp = rip[1] === "-" ? -raw : raw;
-          const next = asNativePointer(i.next) || src.add(i.size || 0);
-          return readPointerSafe(next.add(disp));
-        }
-      }
-      const absolute = opStr.match(/\[\s*(0x[0-9a-fA-F]+)\s*\]/i);
-      if (absolute && absolute[1])
-        return readPointerSafe(ptr(absolute[1]));
-      return null;
-    }
-    function callTarget(instr) {
-      return directCallTarget(instr) || memoryCallTarget(instr);
-    }
-    function shouldTrackExternalCallsite(instr) {
-      const src = asNativePointer(instr.address);
-      const srcMod = findModuleSafe(src);
-      if (!isTarget(srcMod))
-        return null;
-      const target = callTarget(instr);
-      if (!target)
-        return null;
-      const dstMod = findModuleSafe(target);
-      if (!dstMod || isTarget(dstMod))
-        return null;
-      return target;
-    }
-    function captureArgs(ctx, seq, tid) {
-      if (Process.arch === "ia32") {
-        const x2 = ctx;
-        const arg0 = x2.esp;
-        const arg1 = x2.esp.add(4);
-        const arg2 = x2.esp.add(8);
-        const arg3 = x2.esp.add(12);
-        const readArg = (p) => {
-          try {
-            return p.readPointer().toString();
-          } catch (_) {
-            return "";
-          }
-        };
-        return {
-          seq,
-          kind: 0,
-          tid,
-          arch: "ia32",
-          rcx: readArg(arg0),
-          rdx: readArg(arg1),
-          r8: readArg(arg2),
-          r9: readArg(arg3),
-          rsp: x2.esp.toString()
-        };
-      }
-      const x = ctx;
-      return {
-        seq,
-        kind: 0,
-        tid,
-        arch: "x64",
-        rcx: x.rcx.toString(),
-        rdx: x.rdx.toString(),
-        r8: x.r8.toString(),
-        r9: x.r9.toString(),
-        rsp: x.rsp.toString()
-      };
     }
     var THREAD_SUSPEND_RESUME = 2;
     function getThreadApi() {
@@ -398,8 +449,10 @@ var require_agent = __commonJS({
             if (rv.toInt32() !== 0)
               return;
             for (const mod of Process.enumerateModules()) {
-              if (!this._before.has(mod.name.toLowerCase()))
+              if (!this._before.has(mod.name.toLowerCase())) {
                 recordLoad(mod.name, mod.base, mod.size);
+                hookTargetExports(mod);
+              }
             }
           }
         });
@@ -440,49 +493,7 @@ var require_agent = __commonJS({
                   continue;
                 const loc = ev[1];
                 const target = ev[2];
-                const srcMod = findModuleSafe(loc);
-                const dstMod = findModuleSafe(target);
-                if (g_targets.size > 0) {
-                  if (!isTarget(srcMod) && !isTarget(dstMod))
-                    continue;
-                }
-                const seq = nextSeq();
-                const out = {
-                  k: ks === "call" ? 0 : 1,
-                  src: ph(loc),
-                  dst: ph(target),
-                  tid,
-                  seq,
-                  src_module: srcMod ? srcMod.name : "unknown",
-                  src_offset: moduleOffset(loc, srcMod),
-                  src_symbol: symbolName(loc),
-                  dst_module: dstMod ? dstMod.name : "unknown",
-                  dst_offset: moduleOffset(target, dstMod),
-                  dst_symbol: symbolName(target)
-                };
-                g_events.push(out);
-              }
-            },
-            transform(iterator) {
-              let instr;
-              while ((instr = iterator.next()) !== null) {
-                const mn = instr.mnemonic.toLowerCase();
-                if (mn === "call") {
-                  const caller = instr.address;
-                  const externalTarget = shouldTrackExternalCallsite(instr);
-                  if (externalTarget) {
-                    iterator.putCallout(() => {
-                      noteExternalCall(caller, externalTarget);
-                    });
-                  }
-                  if (ENABLE_ARG_SNAPSHOTS) {
-                    const _tid = tid;
-                    iterator.putCallout((ctx) => {
-                      g_snapshots.push(captureArgs(ctx, g_events.length, _tid));
-                    });
-                  }
-                }
-                iterator.keep();
+                recordTraceEvent(ks, loc, target, tid, "stalker");
               }
             }
           });
@@ -538,7 +549,7 @@ var require_agent = __commonJS({
         sendTraceChunk("periodic");
         send({
           type: "status",
-          text: "trace_stats events=" + g_events.length + " snapshots=" + g_snapshots.length + " modules=" + g_mod_events.length + " sync=" + g_sync_events.length + " handles=" + g_handle_events.length
+          text: "trace_stats events=" + g_events.length + " modules=" + g_mod_events.length + " sync=" + g_sync_events.length + " handles=" + g_handle_events.length
         });
       }, 1e3);
     }
@@ -564,6 +575,8 @@ var require_agent = __commonJS({
           scheduleFailureScan("thread_create_no_tid");
           return;
         }
+        const creator = pointerDetails(callerVa);
+        const start = pointerDetails(startVa);
         g_spawn_events.push({
           seq: nextSeq(),
           api: apiName,
@@ -573,11 +586,17 @@ var require_agent = __commonJS({
           handle_gen: gen,
           creator_va: callerVa,
           start_va: startVa,
+          creator_module: creator.module,
+          creator_offset: creator.offset,
+          creator_symbol: creator.symbol,
+          start_module: start.module,
+          start_offset: start.offset,
+          start_symbol: start.symbol,
           status
         });
         send({
           type: "status",
-          text: "thread_create tid=" + tid + " parent_tid=" + parentTid + " start=" + startVa + " caller=" + callerVa
+          text: "thread_create tid=" + tid + " parent_tid=" + parentTid + " start=" + startVa + " caller=" + callerVa + " caller_mod=" + creator.module + "!" + creator.offset + " start_mod=" + start.module + "!" + start.offset
         });
         if (!attachStalker(tid, "thread_create")) {
           scheduleFailureScan("thread_create_attach_failed");
@@ -589,7 +608,7 @@ var require_agent = __commonJS({
           onEnter(args) {
             this._hp = args[0];
             this._sv = ph(args[4]);
-            this._cv = consumeRecentExternalCaller(this.context, this.returnAddress);
+            this._cv = findThreadCreator(this.context, this.returnAddress);
             this._pt = Process.getCurrentThreadId();
           },
           onLeave(rv) {
@@ -604,7 +623,7 @@ var require_agent = __commonJS({
           onEnter(args) {
             this._hp = args[0];
             this._sv = "unknown";
-            this._cv = consumeRecentExternalCaller(this.context, this.returnAddress);
+            this._cv = findThreadCreator(this.context, this.returnAddress);
             this._pt = Process.getCurrentThreadId();
           },
           onLeave(rv) {
@@ -621,7 +640,7 @@ var require_agent = __commonJS({
         if (addr) {
           Interceptor.attach(addr, {
             onEnter(_) {
-              flushAndSend("exit");
+              flushAndSend("exit", fn);
             }
           });
         }
@@ -634,7 +653,7 @@ var require_agent = __commonJS({
         if (addr) {
           Interceptor.attach(addr, {
             onEnter(_) {
-              flushAndSend("exit");
+              flushAndSend("exit", fn);
             }
           });
         }
@@ -642,12 +661,11 @@ var require_agent = __commonJS({
     }
     function sendTraceChunk(reason) {
       const events = g_events.slice(g_sent_events);
-      const snapshots = g_snapshots.slice(g_sent_snapshots);
       const modEvents = g_mod_events.slice(g_sent_mod_events);
       const syncEvents = g_sync_events.slice(g_sent_sync_events);
       const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
       const handleEvents = g_handle_events.slice(g_sent_handle_events);
-      if (events.length === 0 && snapshots.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0) {
+      if (events.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0) {
         return;
       }
       send({
@@ -656,20 +674,18 @@ var require_agent = __commonJS({
         reason,
         sent_at_ms: Date.now(),
         events,
-        snapshots,
         mod_events: modEvents,
         sync_events: syncEvents,
         spawn_events: spawnEvents,
         handle_events: handleEvents
       });
       g_sent_events = g_events.length;
-      g_sent_snapshots = g_snapshots.length;
       g_sent_mod_events = g_mod_events.length;
       g_sent_sync_events = g_sync_events.length;
       g_sent_spawn_events = g_spawn_events.length;
       g_sent_handle_events = g_handle_events.length;
     }
-    function flushAndSend(reason) {
+    function flushAndSend(reason, hookName) {
       if (g_flushed)
         return;
       g_flushed = true;
@@ -679,7 +695,7 @@ var require_agent = __commonJS({
       }
       send({
         type: "status",
-        text: "flush_send reason=" + reason + " events=" + g_events.length + " snapshots=" + g_snapshots.length + " modules=" + g_mod_events.length
+        text: "flush_send hook=" + (hookName || "unknown") + " reason=" + reason + " events=" + g_events.length + " modules=" + g_mod_events.length
       });
       sendTraceChunk(reason);
       send({
@@ -688,7 +704,6 @@ var require_agent = __commonJS({
         reason,
         sent_at_ms: Date.now(),
         events: [],
-        snapshots: [],
         mod_events: [],
         sync_events: [],
         spawn_events: [],
@@ -707,10 +722,11 @@ var require_agent = __commonJS({
        * project_info에서 받은 파일명 목록 (소문자).
        */
       setTargets(targets) {
-        g_targets = new Set(targets.map((t) => t.toLowerCase()));
+        g_targets = new Set(targets.map((t) => normalizedTargetName(t)));
         const mainMod = Process.enumerateModules()[0];
         if (mainMod)
-          g_targets.add(mainMod.name.toLowerCase());
+          g_targets.add(normalizedTargetName(mainMod.name));
+        hookLoadedTargetExports();
         send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
       }
     };
@@ -718,11 +734,12 @@ var require_agent = __commonJS({
       if (Process.arch !== "x64" && Process.arch !== "ia32") {
         throw new Error("unsupported architecture: " + Process.arch + " (x64/ia32 required)");
       }
-      Stalker.queueDrainInterval = 50;
+      Stalker.queueDrainInterval = 0;
+      Stalker.trustThreshold = -1;
       send({ type: "status", text: "agent:start session=" + SESSION_ID + " arch=" + Process.arch });
       const mainMod = Process.enumerateModules()[0];
       if (mainMod)
-        g_targets.add(mainMod.name.toLowerCase());
+        g_targets.add(normalizedTargetName(mainMod.name));
       hookModules();
       hookThreadCreation();
       hookExit();
