@@ -381,50 +381,9 @@ class CallTreeBuilder:
                 stack.append(node_id)
 
             elif ev_type == "ret":
-                if self._is_external_to_target_ret(ev):
-                    src_mod = ev.get("src_module", "unknown")
-                    src_off = self._hex(ev.get("src_offset", "0x0"))
-                    src_sym = ev.get("src_symbol", "")
-                    dst_mod = ev.get("dst_module", "unknown")
-                    dst_off = self._hex(ev.get("dst_offset", "0x0"))
-                    dst_sym = ev.get("dst_symbol", "")
-
-                    base_key = "ret_{}+{}".format(dst_mod, hex(dst_off))
-                    call_counter[base_key] = call_counter.get(base_key, 0) + 1
-                    node_id = "{}_{}".format(base_key, call_counter[base_key])
-                    parent_id = stack[-1] if stack else None
-                    depth = (
-                        nodes[parent_id].depth + 1
-                        if parent_id and parent_id in nodes
-                        else len(stack)
-                    )
-                    node = CallNode(
-                        node_id=node_id,
-                        module=dst_mod,
-                        symbol=dst_sym,
-                        offset=dst_off,
-                        tid=tid,
-                        call_seq=call_seq,
-                        depth=depth,
-                    )
-                    node.trace_seq = ev.get("seq", call_seq)
-                    node.src_module = src_mod
-                    node.src_offset = src_off
-                    node.src_symbol = src_sym
-                    call_seq += 1
-                    if parent_id:
-                        node.parent_id = parent_id
-                        if parent_id in nodes:
-                            nodes[parent_id].children_ids.append(node_id)
-                        edges.append(CallEdge(parent_id, node_id, "flow", tid))
-                    else:
-                        node.is_entry = True
-                    nodes[node_id] = node
-                    if stack:
-                        stack[-1] = node_id
-                    else:
-                        stack.append(node_id)
-                    continue
+                # ret는 call stack 정리에만 사용한다. 복귀 주소를 노드로
+                # 그리면 실제 call이 아닌 "다음 실행 위치"가 하위 호출처럼
+                # 보여 부모-자식 관계와 레이아웃을 오염시킨다.
                 if stack:
                     stack.pop()
 
@@ -555,14 +514,6 @@ class CallTreeBuilder:
         src_target = self._is_target_module(ev.get("src_module", ""))
         dst_target = self._is_target_module(ev.get("dst_module", ""))
         return src_target or dst_target
-
-    def _is_external_to_target_ret(self, ev: dict) -> bool:
-        if ev.get("type") != "ret":
-            return False
-        return (
-            not self._is_target_module(ev.get("src_module", ""))
-            and self._is_target_module(ev.get("dst_module", ""))
-        )
 
     @staticmethod
     def _normalize_targets(modules: list[str]) -> set[str]:

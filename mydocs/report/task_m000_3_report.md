@@ -16,7 +16,7 @@ GitHub Issue: [#3](https://github.com/cho2659/JanusRE/issues/3)
 |---|---|---|
 | `frida_agent/agent.ts` | target 이름 판정 helper와 전송 전 trace 필터 추가 | Frida agent trace payload |
 | `frida_agent/agent.js` | 빌드 결과 갱신 | 런타임 agent |
-| `bridge_server.py` | external-to-target ret 그래프 stack 처리 조정 | Call graph 구성 |
+| `bridge_server.py` | ret 그래프 노드 생성을 제거하고 stack pop에만 사용 | Call graph 구성 |
 | `mydocs/orders/20260530.md` | 오늘할일 #3 항목 추가 | 작업 추적 |
 | `mydocs/plans/task_m000_3.md` | 수행계획서 작성 | 작업 계획 |
 | `mydocs/plans/task_m000_3_impl.md` | 구현계획서 작성 | 단계 계획 |
@@ -29,7 +29,7 @@ GitHub Issue: [#3](https://github.com/cho2659/JanusRE/issues/3)
 | 지표 | 변경 전 | 변경 후 |
 |---|---|---|
 | Python 전송 trace 이벤트 | Stalker raw call/ret 전체 slice | `src_module` 또는 `dst_module`이 target인 이벤트만 |
-| 외부 경유 그래프 | 외부에서 내부로 돌아오는 ret 후 stack pop | 내부 복귀 노드가 대표 외부 노드 아래에 남도록 stack top 교체 |
+| ret 이벤트 처리 | 일부 external-to-target ret를 그래프 노드로 생성 | 그래프 노드 생성 없이 call stack pop에만 사용 |
 
 ## 검증 결과
 
@@ -37,7 +37,7 @@ GitHub Issue: [#3](https://github.com/cho2659/JanusRE/issues/3)
 |---|---|
 | 외부-only trace 이벤트가 Python payload에서 제외된다 | OK — `filterTraceEventsForSend()`가 target 관련 이벤트만 반환 |
 | target 관련 이벤트는 유지된다 | OK — `src_module` 또는 `dst_module` 중 하나가 target이면 유지 |
-| `내부1 -> 외부1 -> 외부2 ... -> 내부2` 흐름은 대표 외부 노드 중심으로 남는다 | OK — 외부-only 이벤트는 전송 제외, external-to-target ret는 대표 외부 노드 아래 내부 복귀 노드로 연결 |
+| `내부1 -> 외부1 -> 외부2 ... -> 내부2` 흐름은 대표 외부 노드 중심으로 남는다 | OK — 외부-only 이벤트는 전송 제외, ret는 노드 생성 없이 stack 정리에만 사용 |
 | 기존 target 내부 call/jmp 추적을 제거하지 않는다 | OK — Stalker follow, transform, `recordJumpFromCallout()` 수집 경로는 유지 |
 | PR 생략 | OK — 작업지시자 지시에 따라 로컬 브랜치에서 구현 및 검증 |
 
@@ -57,7 +57,7 @@ GitHub Issue: [#3](https://github.com/cho2659/JanusRE/issues/3)
 ### 후속 작업 후보
 
 - 장시간 trace에서 agent 내부 raw trace 보관량을 제한하거나 압축하는 별도 task
-- 실제 바이너리 기반으로 ret/call 이벤트 의미를 샘플링해 그래프 연결 규칙 보정
+- 실제 바이너리 기반으로 call/ret stack 정합성을 샘플링해 그래프 연결 규칙 보정
 
 ## 작업지시자 승인 요청
 

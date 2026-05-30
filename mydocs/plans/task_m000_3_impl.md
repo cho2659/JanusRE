@@ -22,13 +22,13 @@ GitHub Issue: [#3](https://github.com/cho2659/JanusRE/issues/3)
 
 - `Task #3 Stage 1: trace 전송 필터 추가`
 
-## Stage 2 — 외부 경유 그래프 연결
+## Stage 2 — ret 그래프 제외
 
 ### 산출물
 
 - `bridge_server.py`
-  - 외부에서 target으로 들어오는 call이 대표 외부 노드 아래에 붙도록 현재 stack 동작 확인
-  - 외부에서 target으로 복귀하는 ret 이벤트가 대표 외부 노드를 과도하게 pop하지 않도록 조정
+  - ret 이벤트를 그래프 노드로 만들지 않고 call stack pop에만 사용
+  - 외부 경유 후 target으로 다시 들어오는 실제 call은 기존 call 노드 생성 경로를 사용
 
 ### 검증
 
