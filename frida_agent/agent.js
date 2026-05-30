@@ -1,5 +1,5 @@
 📦
-33197 /agent.js
+30941 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -42,7 +42,6 @@ var require_agent = __commonJS({
     var g_handle_gen_by_key = /* @__PURE__ */ new Map();
     var g_next_handle_gen = 1;
     var g_symbol_name_by_va = /* @__PURE__ */ new Map();
-    var g_hooked_target_exports = /* @__PURE__ */ new Set();
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_export_symbols_by_module = /* @__PURE__ */ new Map();
     var g_target_ranges = [];
@@ -265,57 +264,6 @@ var require_agent = __commonJS({
         noteExternalBoundaryCall(tid, loc, target, dstMod);
       }
     }
-    function hookTargetExports(mod) {
-      if (!isTarget(mod))
-        return;
-      let hooked = 0;
-      let failed = 0;
-      let exports2 = [];
-      try {
-        exports2 = mod.enumerateExports();
-      } catch (_) {
-        return;
-      }
-      for (const ex of exports2) {
-        if (ex.type !== "function")
-          continue;
-        const key = normalizedTargetName(mod.name) + "!" + ex.name + "@" + ph(ex.address);
-        if (g_hooked_target_exports.has(key))
-          continue;
-        g_hooked_target_exports.add(key);
-        try {
-          Interceptor.attach(ex.address, {
-            onEnter(_) {
-              const tid = Process.getCurrentThreadId();
-              const ra = this.returnAddress;
-              this._fd_tid = tid;
-              this._fd_ra = ra;
-              recordTraceEvent("call", ra, ex.address, tid, "target_export");
-            },
-            onLeave(_) {
-              const tid = this._fd_tid || Process.getCurrentThreadId();
-              const ra = this._fd_ra;
-              if (ra)
-                recordTraceEvent("ret", ex.address, ra, tid, "target_export");
-            }
-          });
-          hooked++;
-        } catch (_) {
-          failed++;
-        }
-      }
-      if (hooked > 0 || failed > 0) {
-        send({
-          type: "status",
-          text: "target_export_hooks module=" + mod.name + " hooked=" + hooked + " failed=" + failed
-        });
-      }
-    }
-    function hookLoadedTargetExports() {
-      for (const mod of Process.enumerateModules()) {
-        hookTargetExports(mod);
-      }
-    }
     function parseSignedInteger(text) {
       const s = text.trim().toLowerCase();
       if (!s)
@@ -489,18 +437,11 @@ var require_agent = __commonJS({
         return src.compare(dst) !== 0;
       return false;
     }
-    function isExecutableAddress(addr) {
-      try {
-        return Memory.queryProtection(addr).includes("x");
-      } catch (_) {
-        return false;
-      }
-    }
     function recordJumpFromCallout(tid, instrAddress, instrSize, opStr, ctx, instruction) {
       const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize, instruction);
       if (!target || target.isNull())
         return;
-      if (!isFunctionBoundaryJump(instrAddress, target) && !isExecutableAddress(target))
+      if (!isFunctionBoundaryJump(instrAddress, target))
         return;
       recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
     }
@@ -629,7 +570,6 @@ var require_agent = __commonJS({
               if (!this._before.has(mod.name.toLowerCase())) {
                 recordLoad(mod.name, mod.base, mod.size);
                 refreshTargetRanges();
-                hookTargetExports(mod);
               }
             }
           }
@@ -722,14 +662,6 @@ var require_agent = __commonJS({
       const currentTid = Process.getCurrentThreadId();
       const seenTids = Process.enumerateThreads().map((t) => t.id);
       const tids = seenTids.filter((tid) => tid !== currentTid);
-      recordThreadTraceEvent({
-        action: "snapshot",
-        reason,
-        current_tid: currentTid,
-        seen_tids: seenTids,
-        stalked_tids: Array.from(g_stalked),
-        failed_tids: Array.from(g_attach_failed)
-      });
       let attempted = 0;
       for (const tid of tids) {
         if (g_stalked.has(tid))
@@ -942,9 +874,6 @@ var require_agent = __commonJS({
       startTrace(initialTids) {
         beginTrace(initialTids ?? []);
       },
-      followTid(tid, reason) {
-        return attachStalker(Number(tid), reason || "debug_event");
-      },
       /**
        * 타겟 모듈 목록 주입. frida_bridge_server.py가 세션 시작 후 호출.
        * project_info에서 받은 파일명 목록 (소문자).
@@ -957,7 +886,6 @@ var require_agent = __commonJS({
         if (mainMod)
           addTargetName(mainMod.name);
         refreshTargetRanges();
-        hookLoadedTargetExports();
         send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
       }
     };

@@ -94,14 +94,10 @@ interface HandleEvent {
 
 interface ThreadTraceEvent {
   seq: number;
-  action: "snapshot" | "follow" | "skip" | "failed";
+  action: "follow" | "skip" | "failed";
   tid?: number;
   reason: string;
   ok?: boolean;
-  current_tid?: number;
-  seen_tids?: number[];
-  stalked_tids?: number[];
-  failed_tids?: number[];
   message?: string;
 }
 
@@ -146,7 +142,6 @@ let g_sent_thread_events = 0;
 const g_handle_gen_by_key: Map<string, number> = new Map();
 let g_next_handle_gen = 1;
 const g_symbol_name_by_va: Map<string, string> = new Map();
-const g_hooked_target_exports: Set<string> = new Set();
 
 type LastExternalCall = {
   caller_va: string;
@@ -399,59 +394,6 @@ function recordTraceEvent(
   }
 }
 
-function hookTargetExports(mod: Module): void {
-  if (!isTarget(mod)) return;
-
-  let hooked = 0;
-  let failed = 0;
-  let exports: ModuleExportDetails[] = [];
-  try {
-    exports = mod.enumerateExports();
-  } catch (_) {
-    return;
-  }
-
-  for (const ex of exports) {
-    if (ex.type !== "function") continue;
-    const key = normalizedTargetName(mod.name) + "!" + ex.name + "@" + ph(ex.address);
-    if (g_hooked_target_exports.has(key)) continue;
-    g_hooked_target_exports.add(key);
-    try {
-      Interceptor.attach(ex.address, {
-        onEnter(_) {
-          const tid = Process.getCurrentThreadId();
-          const ra = (this as any).returnAddress as NativePointer;
-          (this as any)._fd_tid = tid;
-          (this as any)._fd_ra = ra;
-          recordTraceEvent("call", ra, ex.address, tid, "target_export");
-        },
-        onLeave(_) {
-          const tid = (this as any)._fd_tid || Process.getCurrentThreadId();
-          const ra = (this as any)._fd_ra as NativePointer | undefined;
-          if (ra) recordTraceEvent("ret", ex.address, ra, tid, "target_export");
-        },
-      });
-      hooked++;
-    } catch (_) {
-      failed++;
-    }
-  }
-
-  if (hooked > 0 || failed > 0) {
-    send({
-      type: "status",
-      text: "target_export_hooks module=" + mod.name
-        + " hooked=" + hooked + " failed=" + failed,
-    });
-  }
-}
-
-function hookLoadedTargetExports(): void {
-  for (const mod of Process.enumerateModules()) {
-    hookTargetExports(mod);
-  }
-}
-
 function parseSignedInteger(text: string): number | null {
   const s = text.trim().toLowerCase();
   if (!s) return null;
@@ -613,14 +555,6 @@ function isFunctionBoundaryJump(src: NativePointer, dst: NativePointer): boolean
   return false;
 }
 
-function isExecutableAddress(addr: NativePointer): boolean {
-  try {
-    return Memory.queryProtection(addr).includes("x");
-  } catch (_) {
-    return false;
-  }
-}
-
 function recordJumpFromCallout(
   tid: number,
   instrAddress: NativePointer,
@@ -631,7 +565,7 @@ function recordJumpFromCallout(
 ): void {
   const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize, instruction);
   if (!target || target.isNull()) return;
-  if (!isFunctionBoundaryJump(instrAddress, target) && !isExecutableAddress(target)) return;
+  if (!isFunctionBoundaryJump(instrAddress, target)) return;
   recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
 }
 
@@ -776,7 +710,6 @@ function hookModules(): void {
           if (!(this as any)._before.has(mod.name.toLowerCase())) {
             recordLoad(mod.name, mod.base, mod.size);
             refreshTargetRanges();
-            hookTargetExports(mod);
           }
         }
       },
@@ -879,14 +812,6 @@ function scanThreads(reason: string): void {
   const currentTid = Process.getCurrentThreadId();
   const seenTids = Process.enumerateThreads().map(t => t.id);
   const tids = seenTids.filter(tid => tid !== currentTid);
-  recordThreadTraceEvent({
-    action: "snapshot",
-    reason,
-    current_tid: currentTid,
-    seen_tids: seenTids,
-    stalked_tids: Array.from(g_stalked),
-    failed_tids: Array.from(g_attach_failed),
-  });
   let attempted = 0;
   for (const tid of tids) {
     if (g_stalked.has(tid)) continue;
@@ -1144,10 +1069,6 @@ rpc.exports = {
     beginTrace(initialTids ?? []);
   },
 
-  followTid(tid: number, reason?: string): boolean {
-    return attachStalker(Number(tid), reason || "debug_event");
-  },
-
   /**
    * 타겟 모듈 목록 주입. frida_bridge_server.py가 세션 시작 후 호출.
    * project_info에서 받은 파일명 목록 (소문자).
@@ -1159,7 +1080,6 @@ rpc.exports = {
     const mainMod = Process.enumerateModules()[0];
     if (mainMod) addTargetName(mainMod.name);
     refreshTargetRanges();
-    hookLoadedTargetExports();
     send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
   },
 };
