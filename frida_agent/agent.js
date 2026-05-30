@@ -1,5 +1,5 @@
 📦
-30941 /agent.js
+30999 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -241,7 +241,9 @@ var require_agent = __commonJS({
       const srcMod = findModuleSafe(loc);
       const dstMod = findModuleSafe(target);
       const isCall = kind === "call";
-      const dstIsExternal = isCall && isTarget(srcMod) && dstMod !== null && !isTarget(dstMod);
+      const srcIsTarget = isTarget(srcMod);
+      const dstIsTarget = isTarget(dstMod);
+      const dstIsExternal = isCall && srcIsTarget && dstMod !== null && !dstIsTarget;
       const out = {
         k: isCall ? 0 : 1,
         src: ph(loc),
@@ -255,7 +257,7 @@ var require_agent = __commonJS({
         dst_is_external: dstIsExternal,
         source
       };
-      if (isCall || isTarget(srcMod) || isTarget(dstMod)) {
+      if (srcIsTarget || dstIsTarget) {
         out.src_symbol = symbolName(loc);
         out.dst_symbol = symbolName(target);
       }

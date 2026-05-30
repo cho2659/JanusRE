@@ -368,10 +368,12 @@ function recordTraceEvent(
   const srcMod = findModuleSafe(loc);
   const dstMod = findModuleSafe(target);
   const isCall = kind === "call";
+  const srcIsTarget = isTarget(srcMod);
+  const dstIsTarget = isTarget(dstMod);
   const dstIsExternal = isCall
-    && isTarget(srcMod)
+    && srcIsTarget
     && dstMod !== null
-    && !isTarget(dstMod);
+    && !dstIsTarget;
 
   const out: RawEvent = {
     k: isCall ? 0 : 1,
@@ -384,7 +386,7 @@ function recordTraceEvent(
     dst_is_external: dstIsExternal,
     source,
   };
-  if (isCall || isTarget(srcMod) || isTarget(dstMod)) {
+  if (srcIsTarget || dstIsTarget) {
     out.src_symbol = symbolName(loc);
     out.dst_symbol = symbolName(target);
   }
