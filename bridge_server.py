@@ -420,6 +420,11 @@ class CallTreeBuilder:
                     else:
                         node.is_entry = True
                     nodes[node_id] = node
+                    if stack:
+                        stack[-1] = node_id
+                    else:
+                        stack.append(node_id)
+                    continue
                 if stack:
                     stack.pop()
 

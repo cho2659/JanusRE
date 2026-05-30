@@ -1,5 +1,5 @@
 📦
-28775 /agent.js
+29958 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -91,10 +91,31 @@ var require_agent = __commonJS({
       const parts = raw.split("/");
       return parts[parts.length - 1] || raw;
     }
+    function targetNameKeys(name) {
+      const normalized = normalizedTargetName(name);
+      if (!normalized)
+        return [];
+      const keys = [normalized];
+      const dot = normalized.lastIndexOf(".");
+      if (dot > 0)
+        keys.push(normalized.substring(0, dot));
+      return keys;
+    }
+    function addTargetName(name) {
+      for (const key of targetNameKeys(name))
+        g_targets.add(key);
+    }
+    function isTargetModuleName(name) {
+      for (const key of targetNameKeys(name)) {
+        if (g_targets.has(key))
+          return true;
+      }
+      return false;
+    }
     function isTarget(mod) {
       if (!mod)
         return false;
-      return g_targets.has(normalizedTargetName(mod.name));
+      return isTargetModuleName(mod.name);
     }
     function refreshTargetRanges() {
       const ranges = [];
@@ -424,7 +445,7 @@ var require_agent = __commonJS({
     }
     function findTargetCaller(ctx, immediateReturn) {
       const immediateMod = findModuleSafe(immediateReturn || null);
-      if (immediateMod && g_targets.has(immediateMod.name.toLowerCase())) {
+      if (immediateMod && isTargetModuleName(immediateMod.name)) {
         return ph(immediateReturn);
       }
       const arch = Process.arch;
@@ -441,7 +462,7 @@ var require_agent = __commonJS({
         if (ra.isNull())
           break;
         const mod = findModuleSafe(ra);
-        if (mod && g_targets.has(mod.name.toLowerCase()))
+        if (mod && isTargetModuleName(mod.name))
           return ph(ra);
         rsp = rsp.add(Process.pointerSize);
       }
@@ -773,12 +794,18 @@ var require_agent = __commonJS({
       }
     }
     function sendTraceChunk(reason) {
-      const events = g_events.slice(g_sent_events);
+      const rawEvents = g_events.slice(g_sent_events);
+      const events = filterTraceEventsForSend(rawEvents);
       const modEvents = g_mod_events.slice(g_sent_mod_events);
       const syncEvents = g_sync_events.slice(g_sent_sync_events);
       const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
       const handleEvents = g_handle_events.slice(g_sent_handle_events);
       if (events.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0) {
+        g_sent_events = g_events.length;
+        g_sent_mod_events = g_mod_events.length;
+        g_sent_sync_events = g_sync_events.length;
+        g_sent_spawn_events = g_spawn_events.length;
+        g_sent_handle_events = g_handle_events.length;
         return;
       }
       send({
@@ -798,6 +825,11 @@ var require_agent = __commonJS({
       g_sent_spawn_events = g_spawn_events.length;
       g_sent_handle_events = g_handle_events.length;
     }
+    function filterTraceEventsForSend(events) {
+      if (g_targets.size === 0)
+        return events;
+      return events.filter((ev) => isTargetModuleName(ev.src_module || "") || isTargetModuleName(ev.dst_module || ""));
+    }
     function flushAndSend(reason, hookName) {
       if (g_flushed)
         return;
@@ -808,7 +840,7 @@ var require_agent = __commonJS({
       }
       send({
         type: "status",
-        text: "flush_send hook=" + (hookName || "unknown") + " reason=" + reason + " events=" + g_events.length + " modules=" + g_mod_events.length
+        text: "flush_send hook=" + (hookName || "unknown") + " reason=" + reason + " events=" + g_events.length + " send_events=" + filterTraceEventsForSend(g_events.slice(g_sent_events)).length + " modules=" + g_mod_events.length
       });
       sendTraceChunk(reason);
       send({
@@ -835,10 +867,12 @@ var require_agent = __commonJS({
        * project_info에서 받은 파일명 목록 (소문자).
        */
       setTargets(targets) {
-        g_targets = new Set(targets.map((t) => normalizedTargetName(t)));
+        g_targets = /* @__PURE__ */ new Set();
+        for (const target of targets)
+          addTargetName(target);
         const mainMod = Process.enumerateModules()[0];
         if (mainMod)
-          g_targets.add(normalizedTargetName(mainMod.name));
+          addTargetName(mainMod.name);
         refreshTargetRanges();
         hookLoadedTargetExports();
         send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
@@ -853,7 +887,7 @@ var require_agent = __commonJS({
       send({ type: "status", text: "agent:start session=" + SESSION_ID + " arch=" + Process.arch });
       const mainMod = Process.enumerateModules()[0];
       if (mainMod)
-        g_targets.add(normalizedTargetName(mainMod.name));
+        addTargetName(mainMod.name);
       refreshTargetRanges();
       hookModules();
       hookThreadCreation();
