@@ -1,5 +1,5 @@
 📦
-30999 /agent.js
+32446 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -45,6 +45,7 @@ var require_agent = __commonJS({
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_export_symbols_by_module = /* @__PURE__ */ new Map();
     var g_target_ranges = [];
+    var g_target_export_entries = /* @__PURE__ */ new Set();
     var g_targets = /* @__PURE__ */ new Set();
     var SESSION_ID = generateUUID();
     var MAX_BT = 24;
@@ -136,6 +137,7 @@ var require_agent = __commonJS({
         });
       }
       g_target_ranges = ranges;
+      refreshTargetExportEntries();
     }
     function isTargetAddress(addr) {
       for (const range of g_target_ranges) {
@@ -144,6 +146,27 @@ var require_agent = __commonJS({
         }
       }
       return false;
+    }
+    function refreshTargetExportEntries() {
+      g_target_export_entries.clear();
+      for (const mod of Process.enumerateModules()) {
+        if (!isTarget(mod))
+          continue;
+        let exports2 = [];
+        try {
+          exports2 = mod.enumerateExports();
+        } catch (_) {
+          continue;
+        }
+        for (const ex of exports2) {
+          if (ex.type === "function") {
+            g_target_export_entries.add(ph(ex.address));
+          }
+        }
+      }
+    }
+    function isTargetExportEntry(addr) {
+      return g_target_export_entries.has(ph(addr));
     }
     function moduleOffset(addr, mod) {
       if (!mod)
@@ -447,6 +470,21 @@ var require_agent = __commonJS({
         return;
       recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
     }
+    function recordTargetExportEntryFromCallout(tid, entryAddress, ctx) {
+      const arch = Process.arch;
+      const x64 = ctx;
+      const ia32 = ctx;
+      const sp = arch === "ia32" ? ia32.esp : x64.rsp;
+      let returnAddress;
+      try {
+        returnAddress = sp.readPointer();
+      } catch (_) {
+        return;
+      }
+      if (!returnAddress || returnAddress.isNull())
+        return;
+      recordTraceEvent("call", returnAddress, entryAddress, tid, "target_export");
+    }
     function findTargetCaller(ctx, immediateReturn) {
       const immediateMod = findModuleSafe(immediateReturn || null);
       if (immediateMod && isTargetModuleName(immediateMod.name)) {
@@ -607,11 +645,17 @@ var require_agent = __commonJS({
             transform(iterator) {
               let instruction;
               while ((instruction = iterator.next()) !== null) {
+                const address = instruction.address;
+                const inTarget = isTargetAddress(address);
+                if (inTarget && isTargetExportEntry(address)) {
+                  iterator.putCallout((ctx) => {
+                    recordTargetExportEntryFromCallout(tid, address, ctx);
+                  });
+                }
                 const mnemonic = String(instruction.mnemonic || "").toLowerCase();
                 if (mnemonic === "jmp") {
-                  const address = instruction.address;
                   const opStr = String(instruction.opStr || "");
-                  if (isTargetAddress(address) && isIndirectJumpOperand(opStr)) {
+                  if (inTarget && isIndirectJumpOperand(opStr)) {
                     const size = Number(instruction.size || 0);
                     iterator.putCallout((ctx) => {
                       recordJumpFromCallout(tid, address, size, opStr, ctx, instruction);

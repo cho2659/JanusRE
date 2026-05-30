@@ -153,6 +153,7 @@ type LastExternalCall = {
 const g_last_external_call_by_tid: Map<number, LastExternalCall> = new Map();
 const g_export_symbols_by_module: Map<string, Array<{ name: string; address: NativePointer }>> = new Map();
 let g_target_ranges: Array<{ base: NativePointer; end: NativePointer; name: string }> = [];
+const g_target_export_entries: Set<string> = new Set();
 
 // 타겟 모듈 집합 (소문자). rpc.setTargets()로 갱신.
 let g_targets: Set<string> = new Set();
@@ -257,6 +258,7 @@ function refreshTargetRanges(): void {
     });
   }
   g_target_ranges = ranges;
+  refreshTargetExportEntries();
 }
 
 function isTargetAddress(addr: NativePointer): boolean {
@@ -266,6 +268,28 @@ function isTargetAddress(addr: NativePointer): boolean {
     }
   }
   return false;
+}
+
+function refreshTargetExportEntries(): void {
+  g_target_export_entries.clear();
+  for (const mod of Process.enumerateModules()) {
+    if (!isTarget(mod)) continue;
+    let exports: ModuleExportDetails[] = [];
+    try {
+      exports = mod.enumerateExports();
+    } catch (_) {
+      continue;
+    }
+    for (const ex of exports) {
+      if (ex.type === "function") {
+        g_target_export_entries.add(ph(ex.address));
+      }
+    }
+  }
+}
+
+function isTargetExportEntry(addr: NativePointer): boolean {
+  return g_target_export_entries.has(ph(addr));
 }
 
 function moduleOffset(addr: NativePointer, mod: Module | null): string {
@@ -571,6 +595,25 @@ function recordJumpFromCallout(
   recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
 }
 
+function recordTargetExportEntryFromCallout(
+  tid: number,
+  entryAddress: NativePointer,
+  ctx: CpuContext,
+): void {
+  const arch = Process.arch;
+  const x64 = ctx as X64CpuContext;
+  const ia32 = ctx as Ia32CpuContext;
+  const sp = arch === "ia32" ? ia32.esp : x64.rsp;
+  let returnAddress: NativePointer;
+  try {
+    returnAddress = sp.readPointer();
+  } catch (_) {
+    return;
+  }
+  if (!returnAddress || returnAddress.isNull()) return;
+  recordTraceEvent("call", returnAddress, entryAddress, tid, "target_export");
+}
+
 /**
  * 콜스택 역추적: stack pointer를 읽어 리턴 어드레스 체인을 탐색.
  * 타겟 모듈 범위에 속하는 가장 가까운 프레임 VA 반환.
@@ -753,11 +796,17 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
         transform(iterator: any): void {
           let instruction: any;
           while ((instruction = iterator.next()) !== null) {
+            const address = instruction.address as NativePointer;
+            const inTarget = isTargetAddress(address);
+            if (inTarget && isTargetExportEntry(address)) {
+              iterator.putCallout((ctx: CpuContext) => {
+                recordTargetExportEntryFromCallout(tid, address, ctx);
+              });
+            }
             const mnemonic = String(instruction.mnemonic || "").toLowerCase();
             if (mnemonic === "jmp") {
-              const address = instruction.address as NativePointer;
               const opStr = String(instruction.opStr || "");
-              if (isTargetAddress(address) && isIndirectJumpOperand(opStr)) {
+              if (inTarget && isIndirectJumpOperand(opStr)) {
                 const size = Number(instruction.size || 0);
                 iterator.putCallout((ctx: CpuContext) => {
                   recordJumpFromCallout(tid, address, size, opStr, ctx, instruction);
