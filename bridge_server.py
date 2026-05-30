@@ -1898,6 +1898,7 @@ EXIT_THREAD_DEBUG_EVENT = 4
 DBG_CONTINUE = 0x00010002
 DBG_EXCEPTION_NOT_HANDLED = 0x80010001
 EXCEPTION_BREAKPOINT = 0x80000003
+ENABLE_DEBUG_EVENT_WATCHER = False
 
 
 class _DebugEvent(ctypes.Structure):
@@ -2255,6 +2256,11 @@ class FridaWorker(QObject):
         return sess
 
     def _start_debug_event_watcher(self):
+        if not ENABLE_DEBUG_EVENT_WATCHER:
+            dbg("debug event watcher disabled: thread resume safety")
+            self.status_changed.emit(
+                "debug event watcher 비활성화: 스레드 재개 안전 우선")
+            return
         if os.name != "nt" or self._pid is None:
             return
         if self._debugger_thread is not None:
