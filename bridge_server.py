@@ -2052,7 +2052,6 @@ class FridaWorker(QObject):
             dbg("script.load begin")
             self._script.load()
             dbg("script.load ok")
-            self._start_debug_event_watcher()
             if self._project_files:
                 dbg("set_targets begin: count={}".format(len(self._project_files)))
                 self._script.exports_sync.set_targets(self._project_files)
@@ -2065,6 +2064,7 @@ class FridaWorker(QObject):
             resumed = True
             self._resumed = True
             dbg("frida.resume ok: pid={}".format(self._pid))
+            self._start_debug_event_watcher()
             self.status_changed.emit(
                 "트레이스 시작: {}  arch:{}  tids:{}".format(
                     self._target, pe_machine_name(machine),
