@@ -690,7 +690,8 @@ def calc_node_height(n: "CallNode", all_nodes: dict[str, "CallNode"]) -> int:
 
 def ordered_child_ids(n: "CallNode", all_nodes: dict[str, "CallNode"]) -> list[str]:
     """부모 내부 목록과 scene edge가 공유하는 하위 호출 순서."""
-    child_ids = [cid for cid in n.children_ids if cid in all_nodes]
+    child_ids = [cid for cid in n.children_ids
+                 if cid in all_nodes and cid != n.node_id]
     return sorted(child_ids, key=lambda cid: all_nodes[cid].call_seq)
 
 
@@ -746,45 +747,59 @@ class LayoutWorker:
         # 메모이제이션으로 중복 계산 방지
         _cache: dict[str, float] = {}
 
-        def subtree_height(nid: str) -> float:
+        def subtree_height(nid: str, visiting: Optional[set[str]] = None) -> float:
+            if visiting is None:
+                visiting = set()
+            if nid in visiting:
+                return 0.0
             if nid in _cache:
                 return _cache[nid]
             n = vis.get(nid)
             if not n:
                 _cache[nid] = 0.0
                 return 0.0
+            visiting.add(nid)
             h = float(calc_node_height(n, self._nodes) + V_GAP)
             children = ordered_child_ids(n, vis)
             if children:
-                ch_total = sum(subtree_height(c) for c in children)
+                ch_total = sum(subtree_height(c, visiting) for c in children)
                 h = max(h, ch_total)
+            visiting.remove(nid)
             _cache[nid] = h
             return h
 
         # place: 서브트리를 (depth, top_y) 기준으로 배치.
         # 부모 노드는 자식 서브트리 전체의 수직 중앙에 위치.
-        def place(nid: str, depth: int, top_y: float):
+        def place(nid: str, depth: int, top_y: float,
+                  visiting: Optional[set[str]] = None):
+            if visiting is None:
+                visiting = set()
+            if nid in visiting:
+                return
             n = vis.get(nid)
             if not n:
                 return
+            visiting.add(nid)
             children = ordered_child_ids(n, vis)
 
             node_h = calc_node_height(n, self._nodes)
 
             if not children:
                 positions[nid] = (depth * col_w, top_y)
+                visiting.remove(nid)
                 return
 
             # 자식들을 depth+1 컬럼에 순서대로 배치
             child_y = top_y
             for cid in children:
-                place(cid, depth + 1, child_y)
+                place(cid, depth + 1, child_y, visiting)
                 child_y += subtree_height(cid)
 
             # 부모를 자식 블록의 수직 중앙에 배치
             total_children_h = child_y - top_y
             parent_y = top_y + (total_children_h - node_h) / 2.0
             positions[nid] = (depth * col_w, parent_y)
+            visiting.remove(nid)
 
         # 최상위 루트들을 순서대로 배치
         roots = [n for n in vis.values()
@@ -833,10 +848,6 @@ class NodeItem(QGraphicsItem):
         self._searched = False
         self._toggle_hotspots: list[tuple[QRectF, str]] = []
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
-        # 디버깅용: 레이아웃/edge anchor 문제를 눈으로 확인하기 위해
-        # 노드를 직접 끌어 옮길 수 있게 한다. 이동하면 itemChange()에서
-        # 연결선을 즉시 다시 계산한다.
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.setAcceptHoverEvents(True)
 
@@ -988,38 +999,12 @@ class NodeItem(QGraphicsItem):
 
     def mouseDoubleClickEvent(self, event):
         if self.on_activated_cb:
-            pos = event.position() if hasattr(event, "position") else event.pos()
-            for rect, token in self._toggle_hotspots:
-                if rect.contains(pos):
-                    self.on_activated_cb(token)
-                    event.accept()
-                    return
             self.on_activated_cb(self._node.node_id)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
-        pos = event.position() if hasattr(event, "position") else event.pos()
-        for rect, token in self._toggle_hotspots:
-            if rect.contains(pos):
-                if token.startswith("__spawn__:") or token.startswith("__spawned_by__:"):
-                    if self.on_activated_cb:
-                        self.on_activated_cb(token)
-                    event.accept()
-                    return
-                target = self._nodes.get(token)
-                if target:
-                    if token != self._node.node_id:
-                        self._node.expanded = True
-                    target.expanded = not target.expanded
-                    # boundingRect 크기가 변할 수 있으므로 알림
-                    self.prepareGeometryChange()
-                    self.update()
-                    if self.on_toggle_cb:
-                        self.on_toggle_cb(target.node_id)
-                    event.accept()
-                    return
         super().mousePressEvent(event)
         if self.on_selected_cb:
             self.on_selected_cb(self._node.node_id)
@@ -1273,9 +1258,13 @@ class GraphView(QGraphicsView):
             self.fitInView(br.adjusted(-20, -20, 20, 20),
                            Qt.AspectRatioMode.KeepAspectRatio)
 
-    def focus_on(self, node_id: str):
+    def focus_on(self, node_id: str, zoom: bool = False):
         item = self.scene().focus_node(node_id)
         if item:
+            if zoom:
+                self.resetTransform()
+                self._zoom = 1.6
+                self.scale(self._zoom, self._zoom)
             self.centerOn(item)
 
     def reset_zoom(self):
@@ -1369,6 +1358,7 @@ class CallGraphPanel(QWidget):
         self._rendered_tids: set[int] = set()
         self._fit_pending_tids: set[int] = set()
         self._pending_focus: dict[int, str] = {}
+        self._pending_focus_zoom: set[int] = set()
         self._tab_tids: list[int] = []
         self._project_files: list[str] = []
 
@@ -1424,7 +1414,7 @@ class CallGraphPanel(QWidget):
         # 플레이스홀더
         self._placeholder = QLabel(
             "트레이스 완료 후 그래프가 표시됩니다.\n"
-            "클릭: 펼치기/접기  |  더블클릭: Ghidra 이동  |  가운데 버튼: 이동")
+            "클릭: 선택  |  더블클릭: Ghidra 이동  |  가운데 버튼: 이동")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet("color:#9CA3AF;font-size:13px;")
         ly.addWidget(self._placeholder)
@@ -1442,6 +1432,8 @@ class CallGraphPanel(QWidget):
             self._session_data = {}
         self._rendered_tids = set()
         self._fit_pending_tids = set()
+        self._pending_focus = {}
+        self._pending_focus_zoom = set()
         self._apply_initial_expansion()
 
         self._tabs.clear()
@@ -1491,7 +1483,7 @@ class CallGraphPanel(QWidget):
         # 스레드가 먼저 이벤트를 낼 수 있어, main 탭 표시가 흔들린다.
         return min(self._session_data.keys())
 
-    def sync_from_ghidra(self, module: str, offset_hex: str):
+    def sync_from_ghidra(self, module: str, offset_hex: str, zoom: bool = False):
         """Ghidra sync → 해당 노드 선택."""
         try:
             offset = int(offset_hex, 16)
@@ -1503,11 +1495,11 @@ class CallGraphPanel(QWidget):
                     self._switch_to_tid(tid)
                     if tid in self._views:
                         _, view = self._views[tid]
-                        view.focus_on(nid)
+                        view.focus_on(nid, zoom=zoom)
                     return
 
-    def goto_node_token(self, token: str):
-        self._on_goto(token)
+    def goto_node_token(self, token: str, zoom: bool = False):
+        self._on_goto(token, zoom=zoom)
 
     def function_entries(self) -> list[dict]:
         counts: dict[tuple[str, str], int] = {}
@@ -1562,7 +1554,9 @@ class CallGraphPanel(QWidget):
         self._views[tid] = (scene, view)
         self._tab_tids.append(tid)
         suffix = " (main)" if tid == self._main_tid() else ""
-        self._tabs.addTab(view, "Thread {}{}".format(tid, suffix))
+        label = "T{}{}".format(tid, "*" if suffix else "")
+        idx = self._tabs.addTab(view, label)
+        self._tabs.setTabToolTip(idx, "Thread {}{}".format(tid, suffix))
 
     def _switch_to_tid(self, tid: int):
         if tid in self._tab_tids:
@@ -1578,15 +1572,8 @@ class CallGraphPanel(QWidget):
 
         visible = self._visible_nodes(nodes)
 
-        # cross-thread spawn 자식 루트 노드를 이 탭의 씬에 포함
-        extra_nodes = self._cross_thread_nodes(nodes, visible)
-        if extra_nodes:
-            combined_nodes = dict(nodes)
-            combined_nodes.update(extra_nodes)
-            combined_visible = set(visible) | set(extra_nodes.keys())
-        else:
-            combined_nodes  = nodes
-            combined_visible = visible
+        combined_nodes  = nodes
+        combined_visible = visible
 
         scene.rebuild(combined_nodes, edges, combined_visible)
         if fit:
@@ -1603,26 +1590,13 @@ class CallGraphPanel(QWidget):
             view.fit_all()
             self._fit_pending_tids.discard(tid)
         if tid in self._pending_focus:
-            view.focus_on(self._pending_focus.pop(tid))
+            zoom = tid in self._pending_focus_zoom
+            self._pending_focus_zoom.discard(tid)
+            view.focus_on(self._pending_focus.pop(tid), zoom=zoom)
 
     def _visible_nodes(self, nodes: dict[str, CallNode]) -> set[str]:
-        # 현재 구현:
-        #   - 이 스레드의 모든 CallNode를 실제 QGraphicsScene 노드로 만든다.
-        #   - 따라서 부모 NodeItem 안의 하위 항목 목록과 scene에 존재하는
-        #     child 노드의 개념이 같다.
-        #   - expanded는 더 이상 "scene에 존재하는지"를 결정하지 않고,
-        #     사용자가 어떤 노드를 열어 보려 했는지 표시/상호작용 상태에 가깝다.
-        #
-        # 원래 작동해야 하는 방식:
-        #   - 모든 하위 호출은 expand/focus 가능한 실제 노드다.
-        #   - 부모 내부 목록은 실제 노드의 요약 목록일 뿐, 별도의 텍스트 전용
-        #     항목이어서는 안 된다.
-        #   - edge는 부모 내부 목록 줄 위치에서 시작해 같은 child 노드로 향한다.
-        #
-        # 디버깅 효과:
-        #   - root 판정이 잘못되어도 탭이 빈 scene으로 보이지 않는다.
-        #   - 노드 드래그를 켜 두었으므로, 호출 순서/edge anchor 문제를 직접
-        #     움직여 확인할 수 있다.
+        # 이 스레드의 모든 CallNode를 실제 QGraphicsScene 노드로 만든다.
+        # 다른 스레드의 spawn child는 탭 이동 오동작을 막기 위해 섞지 않는다.
         return set(nodes.keys())
 
     def _cross_thread_nodes(self, nodes: dict[str, CallNode],
@@ -1674,41 +1648,16 @@ class CallGraphPanel(QWidget):
             self._relayout(tid, fit=False)  # 접기/펼치기 시 뷰 위치 유지
         elif signal.startswith("__activate__:"):
             inner = signal[len("__activate__:"):]
-            if inner.startswith("__spawn__:"):
-                # spawn 링크 클릭 → 자식 스레드 탭으로 이동
-                try:
-                    child_tid = int(inner[len("__spawn__:"):])
-                    self._switch_to_tid(child_tid)
-                except ValueError:
-                    pass
-            elif inner.startswith("__spawned_by__:"):
-                # spawned_by 링크 클릭 → 부모 스레드 탭으로 이동
-                try:
-                    parent_tid = int(inner[len("__spawned_by__:"):])
-                    self._switch_to_tid(parent_tid)
-                except ValueError:
-                    pass
-            else:
-                node_id = inner
-                # cross-thread 노드일 수도 있으므로 전체 탭에서 검색
-                n = None
-                found_tid = tid
-                current_nodes, _ = self._session_data.get(tid, ({}, []))
-                if node_id in current_nodes:
-                    n = current_nodes[node_id]
-                else:
-                    for t, (ns, _) in self._session_data.items():
-                        if node_id in ns:
-                            n = ns[node_id]
-                            found_tid = t
-                            break
-                if n and not n.module.startswith("["):
-                    if found_tid != self._current_tid:
-                        self._switch_to_tid(found_tid)
-                    if found_tid in self._views:
-                        _, view = self._views[found_tid]
-                        view.focus_on(node_id)
-                    self.sync_requested.emit(n.module, hex(n.offset))
+            if inner.startswith("__spawn__:") or inner.startswith("__spawned_by__:"):
+                return
+            node_id = inner
+            current_nodes, _ = self._session_data.get(tid, ({}, []))
+            n = current_nodes.get(node_id)
+            if n and not n.module.startswith("["):
+                if tid in self._views:
+                    _, view = self._views[tid]
+                    view.focus_on(node_id)
+                self.sync_requested.emit(n.module, hex(n.offset))
         else:
             return
 
@@ -1767,7 +1716,7 @@ class CallGraphPanel(QWidget):
                 p.expanded = True
             cur = p
 
-    def _on_goto(self, node_id: str):
+    def _on_goto(self, node_id: str, zoom: bool = False):
         tid = self._current_tid
         if "|" in node_id:
             t_s, node_id = node_id.split("|", 1)
@@ -1775,11 +1724,15 @@ class CallGraphPanel(QWidget):
             nodes, _ = self._session_data.get(tid, ({}, []))
             self._expand_to(nodes, node_id)
             self._pending_focus[tid] = node_id
+            if zoom:
+                self._pending_focus_zoom.add(tid)
+            else:
+                self._pending_focus_zoom.discard(tid)
             self._switch_to_tid(tid)
             self._relayout(tid)
         if tid in self._views:
             _, view = self._views[tid]
-            view.focus_on(node_id)
+            view.focus_on(node_id, zoom=zoom)
 
     def _fit_all(self):
         if self._current_tid in self._views:
@@ -2784,7 +2737,6 @@ class FunctionSearchPanel(QWidget):
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["함수", "출발지", "도착지"])
         self._tree.setRootIsDecorated(False)
-        self._tree.itemActivated.connect(self._activate)
         self._tree.itemDoubleClicked.connect(self._activate)
         self._tree.setStyleSheet(
             "background:#FFFFFF;color:#1E293B;"
@@ -3148,9 +3100,9 @@ class MainWindow(QMainWindow):
 
     def _on_function_selected(self, module: str, offset_hex: str, graph_token: str):
         if graph_token:
-            self._graph.goto_node_token(graph_token)
+            self._graph.goto_node_token(graph_token, zoom=True)
         else:
-            self._graph.sync_from_ghidra(module, offset_hex)
+            self._graph.sync_from_ghidra(module, offset_hex, zoom=True)
         self._on_graph_sync(module, offset_hex)
 
     def _on_ghidra_sync(self, module: str, offset_hex: str):
