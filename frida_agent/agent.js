@@ -1,5 +1,5 @@
 📦
-31855 /agent.js
+33197 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -25,6 +25,7 @@ var require_agent = __commonJS({
     var g_sync_events = [];
     var g_spawn_events = [];
     var g_handle_events = [];
+    var g_thread_events = [];
     var g_stalked = /* @__PURE__ */ new Set();
     var g_attach_failed = /* @__PURE__ */ new Set();
     var g_seq = 0;
@@ -37,6 +38,7 @@ var require_agent = __commonJS({
     var g_sent_sync_events = 0;
     var g_sent_spawn_events = 0;
     var g_sent_handle_events = 0;
+    var g_sent_thread_events = 0;
     var g_handle_gen_by_key = /* @__PURE__ */ new Map();
     var g_next_handle_gen = 1;
     var g_symbol_name_by_va = /* @__PURE__ */ new Map();
@@ -85,6 +87,12 @@ var require_agent = __commonJS({
       };
       g_handle_events.push(ev);
       return gen;
+    }
+    function recordThreadTraceEvent(ev) {
+      try {
+        g_thread_events.push({ seq: nextSeq(), ...ev });
+      } catch (_) {
+      }
     }
     function normalizedTargetName(name) {
       const raw = (name || "").toLowerCase().replace(/\\/g, "/");
@@ -640,10 +648,12 @@ var require_agent = __commonJS({
     }
     function attachStalker(tid, reason = "unknown") {
       if (g_stalked.has(tid)) {
+        recordThreadTraceEvent({ action: "skip", tid, reason, ok: true, message: "already_stalked" });
         send({ type: "status", text: "stalker_skip:tid=" + tid + " reason=" + reason + " already=1" });
         return true;
       }
       if (tid === Process.getCurrentThreadId()) {
+        recordThreadTraceEvent({ action: "skip", tid, reason, ok: false, message: "current_thread" });
         send({ type: "status", text: "stalker_skip:tid=" + tid + " reason=" + reason + " current=1" });
         return false;
       }
@@ -691,6 +701,7 @@ var require_agent = __commonJS({
           g_attach_failed.add(tid);
           send({ type: "status", text: "stalker_failed:tid=" + tid + " reason=" + reason + " " + e });
         }
+        recordThreadTraceEvent({ action: "failed", tid, reason, ok: false, message: String(e) });
         return false;
       }
       if (!ok) {
@@ -698,16 +709,27 @@ var require_agent = __commonJS({
           g_attach_failed.add(tid);
           send({ type: "status", text: "stalker_failed:tid=" + tid + " reason=" + reason + " attach=0" });
         }
+        recordThreadTraceEvent({ action: "failed", tid, reason, ok: false, message: "attach=0" });
         return false;
       }
       g_attach_failed.delete(tid);
       g_stalked.add(tid);
+      recordThreadTraceEvent({ action: "follow", tid, reason, ok: true });
       send({ type: "status", text: "stalker:tid=" + tid + " reason=" + reason });
       return true;
     }
     function scanThreads(reason) {
       const currentTid = Process.getCurrentThreadId();
-      const tids = Process.enumerateThreads().map((t) => t.id).filter((tid) => tid !== currentTid);
+      const seenTids = Process.enumerateThreads().map((t) => t.id);
+      const tids = seenTids.filter((tid) => tid !== currentTid);
+      recordThreadTraceEvent({
+        action: "snapshot",
+        reason,
+        current_tid: currentTid,
+        seen_tids: seenTids,
+        stalked_tids: Array.from(g_stalked),
+        failed_tids: Array.from(g_attach_failed)
+      });
       let attempted = 0;
       for (const tid of tids) {
         if (g_stalked.has(tid))
@@ -853,12 +875,14 @@ var require_agent = __commonJS({
       const syncEvents = g_sync_events.slice(g_sent_sync_events);
       const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
       const handleEvents = g_handle_events.slice(g_sent_handle_events);
-      if (events.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0) {
+      const threadEvents = g_thread_events.slice(g_sent_thread_events);
+      if (events.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0 && threadEvents.length === 0) {
         g_sent_events = g_events.length;
         g_sent_mod_events = g_mod_events.length;
         g_sent_sync_events = g_sync_events.length;
         g_sent_spawn_events = g_spawn_events.length;
         g_sent_handle_events = g_handle_events.length;
+        g_sent_thread_events = g_thread_events.length;
         return;
       }
       send({
@@ -870,13 +894,15 @@ var require_agent = __commonJS({
         mod_events: modEvents,
         sync_events: syncEvents,
         spawn_events: spawnEvents,
-        handle_events: handleEvents
+        handle_events: handleEvents,
+        thread_events: threadEvents
       });
       g_sent_events = g_events.length;
       g_sent_mod_events = g_mod_events.length;
       g_sent_sync_events = g_sync_events.length;
       g_sent_spawn_events = g_spawn_events.length;
       g_sent_handle_events = g_handle_events.length;
+      g_sent_thread_events = g_thread_events.length;
     }
     function filterTraceEventsForSend(events) {
       if (g_targets.size === 0)
@@ -905,7 +931,8 @@ var require_agent = __commonJS({
         mod_events: [],
         sync_events: [],
         spawn_events: [],
-        handle_events: []
+        handle_events: [],
+        thread_events: []
       });
     }
     rpc.exports = {
@@ -914,6 +941,9 @@ var require_agent = __commonJS({
       },
       startTrace(initialTids) {
         beginTrace(initialTids ?? []);
+      },
+      followTid(tid, reason) {
+        return attachStalker(Number(tid), reason || "debug_event");
       },
       /**
        * 타겟 모듈 목록 주입. frida_bridge_server.py가 세션 시작 후 호출.

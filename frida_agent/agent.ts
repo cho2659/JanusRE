@@ -92,6 +92,19 @@ interface HandleEvent {
   source_gen?: number;
 }
 
+interface ThreadTraceEvent {
+  seq: number;
+  action: "snapshot" | "follow" | "skip" | "failed";
+  tid?: number;
+  reason: string;
+  ok?: boolean;
+  current_tid?: number;
+  seen_tids?: number[];
+  stalked_tids?: number[];
+  failed_tids?: number[];
+  message?: string;
+}
+
 interface AgentPayload {
   type:         "trace_complete" | "trace_chunk";
   session_id:   string;
@@ -102,6 +115,7 @@ interface AgentPayload {
   sync_events:  SyncEvent[];
   spawn_events: ThreadSpawnEvent[];
   handle_events: HandleEvent[];
+  thread_events: ThreadTraceEvent[];
 }
 
 // ══════════════════════════════════════════════════════════
@@ -113,6 +127,7 @@ const g_mod_events:   ModuleEvent[]       = [];
 const g_sync_events:  SyncEvent[]         = [];
 const g_spawn_events: ThreadSpawnEvent[]  = [];
 const g_handle_events: HandleEvent[]      = [];
+const g_thread_events: ThreadTraceEvent[] = [];
 const g_stalked:      Set<number>         = new Set();
 const g_attach_failed:Set<number>         = new Set();
 
@@ -126,6 +141,7 @@ let g_sent_mod_events = 0;
 let g_sent_sync_events = 0;
 let g_sent_spawn_events = 0;
 let g_sent_handle_events = 0;
+let g_sent_thread_events = 0;
 
 const g_handle_gen_by_key: Map<string, number> = new Map();
 let g_next_handle_gen = 1;
@@ -194,6 +210,14 @@ function recordHandleCreate(
   };
   g_handle_events.push(ev);
   return gen;
+}
+
+function recordThreadTraceEvent(ev: Omit<ThreadTraceEvent, "seq">): void {
+  try {
+    g_thread_events.push({ seq: nextSeq(), ...ev });
+  } catch (_) {
+    // Thread census must never block process resume or tracing.
+  }
 }
 
 function normalizedTargetName(name: string): string {
@@ -776,10 +800,12 @@ function hookModules(): void {
 
 function attachStalker(tid: number, reason: string = "unknown"): boolean {
   if (g_stalked.has(tid)) {
+    recordThreadTraceEvent({ action: "skip", tid, reason, ok: true, message: "already_stalked" });
     send({ type: "status", text: "stalker_skip:tid=" + tid + " reason=" + reason + " already=1" });
     return true;
   }
   if (tid === Process.getCurrentThreadId()) {
+    recordThreadTraceEvent({ action: "skip", tid, reason, ok: false, message: "current_thread" });
     send({ type: "status", text: "stalker_skip:tid=" + tid + " reason=" + reason + " current=1" });
     return false;
   }
@@ -830,6 +856,7 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
       g_attach_failed.add(tid);
       send({ type: "status", text: "stalker_failed:tid=" + tid + " reason=" + reason + " " + e });
     }
+    recordThreadTraceEvent({ action: "failed", tid, reason, ok: false, message: String(e) });
     return false;
   }
 
@@ -838,19 +865,28 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
       g_attach_failed.add(tid);
       send({ type: "status", text: "stalker_failed:tid=" + tid + " reason=" + reason + " attach=0" });
     }
+    recordThreadTraceEvent({ action: "failed", tid, reason, ok: false, message: "attach=0" });
     return false;
   }
   g_attach_failed.delete(tid);
   g_stalked.add(tid);
+  recordThreadTraceEvent({ action: "follow", tid, reason, ok: true });
   send({ type: "status", text: "stalker:tid=" + tid + " reason=" + reason });
   return true;
 }
 
 function scanThreads(reason: string): void {
   const currentTid = Process.getCurrentThreadId();
-  const tids = Process.enumerateThreads()
-    .map(t => t.id)
-    .filter(tid => tid !== currentTid);
+  const seenTids = Process.enumerateThreads().map(t => t.id);
+  const tids = seenTids.filter(tid => tid !== currentTid);
+  recordThreadTraceEvent({
+    action: "snapshot",
+    reason,
+    current_tid: currentTid,
+    seen_tids: seenTids,
+    stalked_tids: Array.from(g_stalked),
+    failed_tids: Array.from(g_attach_failed),
+  });
   let attempted = 0;
   for (const tid of tids) {
     if (g_stalked.has(tid)) continue;
@@ -1027,17 +1063,19 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
   const syncEvents = g_sync_events.slice(g_sent_sync_events);
   const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
   const handleEvents = g_handle_events.slice(g_sent_handle_events);
+  const threadEvents = g_thread_events.slice(g_sent_thread_events);
 
   if (
     events.length === 0 && modEvents.length === 0
     && syncEvents.length === 0 && spawnEvents.length === 0
-    && handleEvents.length === 0
+    && handleEvents.length === 0 && threadEvents.length === 0
   ) {
     g_sent_events = g_events.length;
     g_sent_mod_events = g_mod_events.length;
     g_sent_sync_events = g_sync_events.length;
     g_sent_spawn_events = g_spawn_events.length;
     g_sent_handle_events = g_handle_events.length;
+    g_sent_thread_events = g_thread_events.length;
     return;
   }
 
@@ -1048,6 +1086,7 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
     mod_events: modEvents, sync_events: syncEvents,
     spawn_events: spawnEvents,
     handle_events: handleEvents,
+    thread_events: threadEvents,
   } as AgentPayload);
 
   g_sent_events = g_events.length;
@@ -1055,6 +1094,7 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
   g_sent_sync_events = g_sync_events.length;
   g_sent_spawn_events = g_spawn_events.length;
   g_sent_handle_events = g_handle_events.length;
+  g_sent_thread_events = g_thread_events.length;
 }
 
 function filterTraceEventsForSend(events: RawEvent[]): RawEvent[] {
@@ -1089,6 +1129,7 @@ function flushAndSend(reason: "exit" | "user_stop", hookName?: string): void {
     mod_events: [], sync_events: [],
     spawn_events: [],
     handle_events: [],
+    thread_events: [],
   } as AgentPayload);
 }
 
@@ -1101,6 +1142,10 @@ rpc.exports = {
 
   startTrace(initialTids?: number[]): void {
     beginTrace(initialTids ?? []);
+  },
+
+  followTid(tid: number, reason?: string): boolean {
+    return attachStalker(Number(tid), reason || "debug_event");
   },
 
   /**

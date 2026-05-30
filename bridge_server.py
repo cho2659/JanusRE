@@ -42,6 +42,7 @@ import ctypes
 import json
 import math
 import os
+import queue
 import socket
 import threading
 import time
@@ -1889,6 +1890,28 @@ def enumerate_process_threads(pid: int) -> list[int]:
     return tids
 
 
+CREATE_PROCESS_DEBUG_EVENT = 3
+CREATE_THREAD_DEBUG_EVENT = 2
+EXCEPTION_DEBUG_EVENT = 1
+EXIT_PROCESS_DEBUG_EVENT = 5
+EXIT_THREAD_DEBUG_EVENT = 4
+DBG_CONTINUE = 0x00010002
+DBG_EXCEPTION_NOT_HANDLED = 0x80010001
+EXCEPTION_BREAKPOINT = 0x80000003
+
+
+class _DebugEvent(ctypes.Structure):
+    # The union payload is intentionally opaque here. We only need the event
+    # code, PID, and TID; a generous byte buffer keeps the structure large
+    # enough for all DEBUG_EVENT variants on 64-bit Windows.
+    _fields_ = [
+        ("dwDebugEventCode", wintypes.DWORD),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+        ("u", ctypes.c_byte * 176),
+    ]
+
+
 # ============================================================
 # TraceSession
 # ============================================================
@@ -1902,6 +1925,7 @@ class TraceSession:
         self.sync_events:  list[dict] = []
         self.spawn_events: list[dict] = []
         self.handle_events: list[dict] = []
+        self.thread_events: list[dict] = []
         self.modules:      list[str]  = []
         self.reason = ""
         self.saved  = False
@@ -1927,6 +1951,7 @@ class TraceSession:
             "sync_events":  self.sync_events,
             "spawn_events": self.spawn_events,
             "handle_events": self.handle_events,
+            "thread_events": self.thread_events,
             "modules":      self.modules,
             "reason":       self.reason,
         }
@@ -1942,6 +1967,7 @@ class TraceSession:
         s.sync_events  = d.get("sync_events", [])
         s.spawn_events = d.get("spawn_events", [])
         s.handle_events = d.get("handle_events", [])
+        s.thread_events = d.get("thread_events", [])
         s.modules      = d.get("modules", [])
         s.reason       = d.get("reason", "loaded")
         s.saved        = True
@@ -1982,7 +2008,14 @@ class FridaWorker(QObject):
         self._chunk_sync_events: list[dict] = []
         self._chunk_spawn_events: list[dict] = []
         self._chunk_handle_events: list[dict] = []
+        self._chunk_thread_events: list[dict] = []
         self._session_id: Optional[str] = None
+        self._debugger_stop = threading.Event()
+        self._debugger_thread: Optional[threading.Thread] = None
+        self._debugger_follow_thread: Optional[threading.Thread] = None
+        self._debugger_follow_queue: queue.Queue[tuple[int, str]] = queue.Queue()
+        self._debugger_attached = False
+        self._follow_rpc_lock = threading.Lock()
 
     def start_trace(self):
         dbg("start_trace requested: target={}".format(self._target))
@@ -2019,6 +2052,7 @@ class FridaWorker(QObject):
             dbg("script.load begin")
             self._script.load()
             dbg("script.load ok")
+            self._start_debug_event_watcher()
             if self._project_files:
                 dbg("set_targets begin: count={}".format(len(self._project_files)))
                 self._script.exports_sync.set_targets(self._project_files)
@@ -2163,6 +2197,7 @@ class FridaWorker(QObject):
                 or self._chunk_sync_events
                 or self._chunk_spawn_events
                 or self._chunk_handle_events
+                or self._chunk_thread_events
             )
 
     def _append_trace_payload(self, pl: dict):
@@ -2173,7 +2208,7 @@ class FridaWorker(QObject):
                 sent_at_ms = int(time.time() * 1000)
             for key in (
                 "events", "mod_events", "sync_events",
-                "spawn_events", "handle_events"):
+                "spawn_events", "handle_events", "thread_events"):
                 for ev in pl.get(key, []):
                     if isinstance(ev, dict) and "sent_at_ms" not in ev:
                         ev["sent_at_ms"] = sent_at_ms
@@ -2182,12 +2217,14 @@ class FridaWorker(QObject):
             self._chunk_sync_events.extend(pl.get("sync_events", []))
             self._chunk_spawn_events.extend(pl.get("spawn_events", []))
             self._chunk_handle_events.extend(pl.get("handle_events", []))
-            dbg("chunk cache totals raw:{} mod:{} sync:{} spawn:{} handle:{}".format(
+            self._chunk_thread_events.extend(pl.get("thread_events", []))
+            dbg("chunk cache totals raw:{} mod:{} sync:{} spawn:{} handle:{} thread:{}".format(
                 len(self._chunk_events),
                 len(self._chunk_mod_events),
                 len(self._chunk_sync_events),
                 len(self._chunk_spawn_events),
-                len(self._chunk_handle_events)))
+                len(self._chunk_handle_events),
+                len(self._chunk_thread_events)))
 
     def _build_session(self, reason: str) -> TraceSession:
         with self._chunk_lock:
@@ -2196,6 +2233,7 @@ class FridaWorker(QObject):
             sync_events = list(self._chunk_sync_events)
             spawn_events = list(self._chunk_spawn_events)
             handle_events = list(self._chunk_handle_events)
+            thread_events = list(self._chunk_thread_events)
             session_id = self._session_id
 
         evs = postprocess(raw, mods)
@@ -2210,13 +2248,131 @@ class FridaWorker(QObject):
         sess.sync_events = sync_events
         sess.spawn_events = spawn_events
         sess.handle_events = handle_events
+        sess.thread_events = thread_events
         sess.modules = names
         sess.reason = reason
         sess.build_graph()
         return sess
 
+    def _start_debug_event_watcher(self):
+        if os.name != "nt" or self._pid is None:
+            return
+        if self._debugger_thread is not None:
+            return
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.DebugActiveProcess.argtypes = [wintypes.DWORD]
+            kernel32.DebugActiveProcess.restype = wintypes.BOOL
+            kernel32.DebugSetProcessKillOnExit.argtypes = [wintypes.BOOL]
+            kernel32.DebugSetProcessKillOnExit.restype = wintypes.BOOL
+            if not kernel32.DebugActiveProcess(int(self._pid)):
+                err = ctypes.get_last_error()
+                dbg("debug event attach failed: pid={} err={}".format(self._pid, err))
+                self.status_changed.emit(
+                    "debug event attach 실패: pid={} err={}".format(self._pid, err))
+                return
+            kernel32.DebugSetProcessKillOnExit(False)
+            self._debugger_attached = True
+            self._debugger_stop.clear()
+            self._debugger_thread = threading.Thread(
+                target=self._debug_event_loop,
+                name="WinDebugEventLoop",
+                daemon=True,
+            )
+            self._debugger_follow_thread = threading.Thread(
+                target=self._debug_follow_loop,
+                name="WinDebugFollowLoop",
+                daemon=True,
+            )
+            self._debugger_thread.start()
+            self._debugger_follow_thread.start()
+            dbg("debug event watcher started: pid={}".format(self._pid))
+            self.status_changed.emit(
+                "debug event watcher 시작: pid={}".format(self._pid))
+        except Exception as e:
+            dbg("debug event watcher start exception: {!r}".format(e))
+            self.status_changed.emit("debug event watcher 실패: {}".format(e))
+
+    def _debug_event_loop(self):
+        if self._pid is None:
+            return
+        pid = int(self._pid)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitForDebugEvent.argtypes = [
+            ctypes.POINTER(_DebugEvent), wintypes.DWORD]
+        kernel32.WaitForDebugEvent.restype = wintypes.BOOL
+        kernel32.ContinueDebugEvent.argtypes = [
+            wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+        kernel32.ContinueDebugEvent.restype = wintypes.BOOL
+
+        ev = _DebugEvent()
+        while not self._debugger_stop.is_set():
+            ok = kernel32.WaitForDebugEvent(ctypes.byref(ev), 100)
+            if not ok:
+                continue
+            code = int(ev.dwDebugEventCode)
+            ev_pid = int(ev.dwProcessId)
+            tid = int(ev.dwThreadId)
+            reason = ""
+            if ev_pid == pid and code == CREATE_PROCESS_DEBUG_EVENT:
+                reason = "debug_create_process"
+            elif ev_pid == pid and code == CREATE_THREAD_DEBUG_EVENT:
+                reason = "debug_create_thread"
+            elif ev_pid == pid and code == EXIT_THREAD_DEBUG_EVENT:
+                dbg("debug thread exit: tid={}".format(tid))
+            elif ev_pid == pid and code == EXIT_PROCESS_DEBUG_EVENT:
+                dbg("debug process exit: pid={}".format(ev_pid))
+                self._debugger_stop.set()
+
+            continue_status = DBG_CONTINUE
+            if code == EXCEPTION_DEBUG_EVENT:
+                exception_code = int.from_bytes(bytes(ev.u[:4]), "little")
+                if exception_code != EXCEPTION_BREAKPOINT:
+                    continue_status = DBG_EXCEPTION_NOT_HANDLED
+            continued = kernel32.ContinueDebugEvent(
+                ev.dwProcessId, ev.dwThreadId, continue_status)
+            if not continued:
+                dbg("ContinueDebugEvent failed: code={} pid={} tid={} err={}".format(
+                    code, ev_pid, tid, ctypes.get_last_error()))
+
+            if reason and tid:
+                dbg("debug thread event: reason={} tid={}".format(reason, tid))
+                self._debugger_follow_queue.put((tid, reason))
+
+    def _debug_follow_loop(self):
+        while not self._debugger_stop.is_set():
+            try:
+                tid, reason = self._debugger_follow_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if self._script is None or self._done:
+                continue
+            try:
+                with self._follow_rpc_lock:
+                    ok = self._script.exports_sync.follow_tid(tid, reason)
+                dbg("debug follow tid={} reason={} ok={}".format(tid, reason, ok))
+            except Exception as e:
+                dbg("debug follow exception: tid={} reason={} {!r}".format(tid, reason, e))
+
+    def _stop_debug_event_watcher(self):
+        self._debugger_stop.set()
+        if os.name == "nt" and self._debugger_attached and self._pid is not None:
+            try:
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.DebugActiveProcessStop.argtypes = [wintypes.DWORD]
+                kernel32.DebugActiveProcessStop.restype = wintypes.BOOL
+                if kernel32.DebugActiveProcessStop(int(self._pid)):
+                    dbg("debug event watcher detached: pid={}".format(self._pid))
+                else:
+                    dbg("debug event watcher detach failed: pid={} err={}".format(
+                        self._pid, ctypes.get_last_error()))
+            except Exception as e:
+                dbg("debug event watcher detach exception: {!r}".format(e))
+        self._debugger_attached = False
+
     def _cleanup(self):
         dbg("cleanup begin")
+        self._stop_debug_event_watcher()
         for obj, m in [(self._script, "unload"), (self._session, "detach")]:
             if m == "detach" and self._detached:
                 dbg("cleanup detach skipped: already detached")
