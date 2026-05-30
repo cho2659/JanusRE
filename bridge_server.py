@@ -310,6 +310,7 @@ class CallTreeBuilder:
 
             ev_type = ev.get("type")
             if ev_type == "call":
+                source = ev.get("source", "")
                 src_mod = ev.get("src_module", "unknown")
                 src_off = self._hex(ev.get("src_offset", "0x0"))
                 src_sym = ev.get("src_symbol", "")
@@ -329,7 +330,7 @@ class CallTreeBuilder:
                 call_counter[base_key] = call_counter.get(base_key, 0) + 1
                 node_id = "{}_{}".format(base_key, call_counter[base_key])
                 parent_id = stack[-1] if stack else None
-                if ev.get("source") == "target_export":
+                if source == "target_export":
                     parent_id = self._source_anchor_node(
                         nodes, caller_anchors, tid, src_mod, src_off, src_sym,
                         call_seq, ev.get("seq", call_seq))
@@ -378,7 +379,10 @@ class CallTreeBuilder:
                     node.is_entry = True
 
                 nodes[node_id] = node
-                stack.append(node_id)
+                if source == "stalker_jmp" and parent_id and stack and parent_id == stack[-1]:
+                    stack[-1] = node_id
+                else:
+                    stack.append(node_id)
 
             elif ev_type == "ret":
                 # ret는 call stack 정리에만 사용한다. 복귀 주소를 노드로

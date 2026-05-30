@@ -13,10 +13,13 @@ ret 복귀 주소가 그래프 노드로 표시되지 않도록 하고, ret는 c
 | 파일 | 변경 요약 |
 |---|---|
 | `bridge_server.py` | ret를 그래프 노드로 그리지 않고 call stack pop에만 사용하도록 조정 |
+| `bridge_server.py` | `stalker_jmp`는 tail-call 성격으로 stack top을 교체하도록 조정 |
+| `frida_agent/agent.ts` | x86 operand 기반 indirect jmp 목적지 해석과 실행 가능 주소 fallback 추가 |
+| `frida_agent/agent.js` | `agent.ts` 변경분을 `npm run build`로 반영 |
 
 ## 본문 변경 정도 / 본문 무손실 여부
 
-기존 그래프 필터 정책은 유지했다. ret 복귀 주소를 그래프 노드로 만들면 실제 call이 아닌 다음 실행 위치가 하위 호출처럼 보이므로, ret는 stack 정리에만 사용한다.
+기존 그래프 필터 정책은 유지했다. ret 복귀 주소를 그래프 노드로 만들면 실제 call이 아닌 다음 실행 위치가 하위 호출처럼 보이므로, ret는 stack 정리에만 사용한다. target 내부 indirect jmp는 operand 기반으로 목적지를 해석하고, `stalker_jmp` 이벤트는 tail-call처럼 현재 stack top을 교체한다.
 
 ## 검증 결과
 
@@ -24,13 +27,15 @@ ret 복귀 주소가 그래프 노드로 표시되지 않도록 하고, ret는 c
 
 ```bash
 python -c "import ast, pathlib; ast.parse(pathlib.Path('bridge_server.py').read_text(encoding='utf-8')); print('bridge_server.py syntax OK')"
+npm run build
 git diff -- bridge_server.py
 ```
 
 결과:
 
 - OK — `bridge_server.py syntax OK`를 확인했다.
-- OK — 변경 범위가 `CallTreeBuilder._build_thread()`의 ret 처리에 한정됨을 확인했다.
+- OK — `frida-compile agent.ts -o agent.js`가 성공했다.
+- OK — 변경 범위가 `CallTreeBuilder._build_thread()`의 ret/jmp stack 처리와 agent indirect jmp 해석에 한정됨을 확인했다.
 
 ## 잔여 위험
 

@@ -473,7 +473,11 @@ function resolveJumpTarget(
   ctx: CpuContext,
   instrAddress: NativePointer,
   instrSize: number,
+  instruction?: any,
 ): NativePointer | null {
+  const operandTarget = resolveJumpTargetFromOperands(instruction, ctx, instrAddress, instrSize);
+  if (operandTarget) return operandTarget;
+
   const op = opStr.trim().toLowerCase();
   if (!op) return null;
 
@@ -520,6 +524,53 @@ function resolveJumpTarget(
   }
 }
 
+function resolveJumpTargetFromOperands(
+  instruction: any,
+  ctx: CpuContext,
+  instrAddress: NativePointer,
+  instrSize: number,
+): NativePointer | null {
+  const operands = instruction && instruction.operands;
+  if (!operands || operands.length < 1) return null;
+  const op = operands[0];
+  if (!op || !op.type) return null;
+
+  if (op.type === "reg") {
+    return contextRegister(ctx, String(op.value || ""));
+  }
+
+  if (op.type !== "mem" || !op.value) return null;
+  const mem = op.value;
+  let base: NativePointer | null = null;
+  if (mem.base) {
+    const baseName = String(mem.base).toLowerCase();
+    base = (baseName === "rip" || baseName === "eip")
+      ? instrAddress.add(instrSize)
+      : contextRegister(ctx, baseName);
+  }
+
+  let address = base || ptr(0);
+  if (mem.index) {
+    const index = contextRegister(ctx, String(mem.index));
+    const scale = Number(mem.scale || 1);
+    if (index) {
+      if (scale === 1) address = address.add(index);
+      else if (scale === 2) address = address.add(index.shl(1));
+      else if (scale === 4) address = address.add(index.shl(2));
+      else if (scale === 8) address = address.add(index.shl(3));
+      else address = address.add(index.toInt32() * scale);
+    }
+  }
+  const disp = Number(mem.disp || 0);
+  address = address.add(disp);
+
+  try {
+    return address.readPointer();
+  } catch (_) {
+    return null;
+  }
+}
+
 function symbolBase(name: string): string {
   return (name || "").replace(/\+0x[0-9a-f]+$/i, "").toLowerCase();
 }
@@ -538,16 +589,25 @@ function isFunctionBoundaryJump(src: NativePointer, dst: NativePointer): boolean
   return false;
 }
 
+function isExecutableAddress(addr: NativePointer): boolean {
+  try {
+    return Memory.queryProtection(addr).includes("x");
+  } catch (_) {
+    return false;
+  }
+}
+
 function recordJumpFromCallout(
   tid: number,
   instrAddress: NativePointer,
   instrSize: number,
   opStr: string,
   ctx: CpuContext,
+  instruction?: any,
 ): void {
-  const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize);
+  const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize, instruction);
   if (!target || target.isNull()) return;
-  if (!isFunctionBoundaryJump(instrAddress, target)) return;
+  if (!isFunctionBoundaryJump(instrAddress, target) && !isExecutableAddress(target)) return;
   recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
 }
 
@@ -739,7 +799,7 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
               if (isTargetAddress(address) && isIndirectJumpOperand(opStr)) {
                 const size = Number(instruction.size || 0);
                 iterator.putCallout((ctx: CpuContext) => {
-                  recordJumpFromCallout(tid, address, size, opStr, ctx);
+                  recordJumpFromCallout(tid, address, size, opStr, ctx, instruction);
                 });
               }
             }

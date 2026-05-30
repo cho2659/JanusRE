@@ -1,5 +1,5 @@
 📦
-29958 /agent.js
+31855 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -369,7 +369,10 @@ var require_agent = __commonJS({
         return false;
       return /^[a-z][a-z0-9]*$/.test(op);
     }
-    function resolveJumpTarget(opStr, ctx, instrAddress, instrSize) {
+    function resolveJumpTarget(opStr, ctx, instrAddress, instrSize, instruction) {
+      const operandTarget = resolveJumpTargetFromOperands(instruction, ctx, instrAddress, instrSize);
+      if (operandTarget)
+        return operandTarget;
       const op = opStr.trim().toLowerCase();
       if (!op)
         return null;
@@ -415,6 +418,49 @@ var require_agent = __commonJS({
         return null;
       }
     }
+    function resolveJumpTargetFromOperands(instruction, ctx, instrAddress, instrSize) {
+      const operands = instruction && instruction.operands;
+      if (!operands || operands.length < 1)
+        return null;
+      const op = operands[0];
+      if (!op || !op.type)
+        return null;
+      if (op.type === "reg") {
+        return contextRegister(ctx, String(op.value || ""));
+      }
+      if (op.type !== "mem" || !op.value)
+        return null;
+      const mem = op.value;
+      let base = null;
+      if (mem.base) {
+        const baseName = String(mem.base).toLowerCase();
+        base = baseName === "rip" || baseName === "eip" ? instrAddress.add(instrSize) : contextRegister(ctx, baseName);
+      }
+      let address = base || ptr(0);
+      if (mem.index) {
+        const index = contextRegister(ctx, String(mem.index));
+        const scale = Number(mem.scale || 1);
+        if (index) {
+          if (scale === 1)
+            address = address.add(index);
+          else if (scale === 2)
+            address = address.add(index.shl(1));
+          else if (scale === 4)
+            address = address.add(index.shl(2));
+          else if (scale === 8)
+            address = address.add(index.shl(3));
+          else
+            address = address.add(index.toInt32() * scale);
+        }
+      }
+      const disp = Number(mem.disp || 0);
+      address = address.add(disp);
+      try {
+        return address.readPointer();
+      } catch (_) {
+        return null;
+      }
+    }
     function symbolBase(name) {
       return (name || "").replace(/\+0x[0-9a-f]+$/i, "").toLowerCase();
     }
@@ -435,11 +481,18 @@ var require_agent = __commonJS({
         return src.compare(dst) !== 0;
       return false;
     }
-    function recordJumpFromCallout(tid, instrAddress, instrSize, opStr, ctx) {
-      const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize);
+    function isExecutableAddress(addr) {
+      try {
+        return Memory.queryProtection(addr).includes("x");
+      } catch (_) {
+        return false;
+      }
+    }
+    function recordJumpFromCallout(tid, instrAddress, instrSize, opStr, ctx, instruction) {
+      const target = resolveJumpTarget(opStr, ctx, instrAddress, instrSize, instruction);
       if (!target || target.isNull())
         return;
-      if (!isFunctionBoundaryJump(instrAddress, target))
+      if (!isFunctionBoundaryJump(instrAddress, target) && !isExecutableAddress(target))
         return;
       recordTraceEvent("call", instrAddress, target, tid, "stalker_jmp");
     }
@@ -609,7 +662,7 @@ var require_agent = __commonJS({
                   if (isTargetAddress(address) && isIndirectJumpOperand(opStr)) {
                     const size = Number(instruction.size || 0);
                     iterator.putCallout((ctx) => {
-                      recordJumpFromCallout(tid, address, size, opStr, ctx);
+                      recordJumpFromCallout(tid, address, size, opStr, ctx, instruction);
                     });
                   }
                 }
