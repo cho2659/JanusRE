@@ -709,6 +709,104 @@ class CallTreeBuilder:
         return child_root.label()
 
 
+class _SyntheticTraceSession:
+    def __init__(self, events: list[dict]):
+        self.events = events
+        self.sync_events: list[dict] = []
+        self.spawn_events: list[dict] = []
+
+
+def _synthetic_call(seq: int, src_mod: str, src_off: str, src_sym: str,
+                    dst_mod: str, dst_off: str, dst_sym: str,
+                    tid: int = 1, source: str = "synthetic") -> dict:
+    return {
+        "type": "call",
+        "thread_id": tid,
+        "seq": seq,
+        "src_module": src_mod,
+        "src_offset": src_off,
+        "src_symbol": src_sym,
+        "dst_module": dst_mod,
+        "dst_offset": dst_off,
+        "dst_symbol": dst_sym,
+        "source": source,
+    }
+
+
+def _synthetic_ret(seq: int, src_mod: str, src_off: str, src_sym: str,
+                   dst_mod: str, dst_off: str, dst_sym: str,
+                   tid: int = 1, source: str = "synthetic") -> dict:
+    return {
+        "type": "ret",
+        "thread_id": tid,
+        "seq": seq,
+        "src_module": src_mod,
+        "src_offset": src_off,
+        "src_symbol": src_sym,
+        "dst_module": dst_mod,
+        "dst_offset": dst_off,
+        "dst_symbol": dst_sym,
+        "source": source,
+    }
+
+
+def _calltree_synthetic_snapshot(events: list[dict],
+                                 target_modules: Optional[list[str]] = None
+                                 ) -> dict:
+    session = _SyntheticTraceSession(events)
+    built = CallTreeBuilder(target_modules=target_modules or ["app.exe"]).build(
+        session)
+    nodes, edges = built.get(1, ({}, []))
+    return {
+        "nodes": [
+            {
+                "id": nid,
+                "symbol": n.symbol,
+                "parent": nodes[n.parent_id].symbol if n.parent_id in nodes else "",
+                "depth": n.depth,
+                "seq": n.trace_seq,
+            }
+            for nid, n in sorted(nodes.items(), key=lambda item: item[1].call_seq)
+        ],
+        "edges": [
+            {
+                "src": nodes[e.src_id].symbol if e.src_id in nodes else e.src_id,
+                "dst": nodes[e.dst_id].symbol if e.dst_id in nodes else e.dst_id,
+                "kind": e.kind,
+            }
+            for e in edges
+        ],
+    }
+
+
+def _run_calltree_synthetic_checks() -> dict:
+    """Manual diagnostic entrypoint for CallTreeBuilder parent false positives.
+
+    Run with:
+      .venv\\Scripts\\python.exe -c "import bridge_server as b; print(b._run_calltree_synthetic_checks())"
+    """
+    mismatch_events = [
+        _synthetic_call(1, "unknown", "0x0", "", "app.exe", "0x100", "A"),
+        _synthetic_call(2, "app.exe", "0x110", "A+0x10", "app.exe", "0x200", "B"),
+        _synthetic_ret(3, "app.exe", "0x100", "A", "unknown", "0x0", ""),
+        _synthetic_call(4, "unknown", "0x0", "", "app.exe", "0x300", "C"),
+    ]
+    mismatch_snapshot = _calltree_synthetic_snapshot(mismatch_events)
+    c_nodes = [
+        n for n in mismatch_snapshot["nodes"]
+        if n["symbol"] == "C"
+    ]
+    c_parent = c_nodes[0]["parent"] if c_nodes else ""
+    return {
+        "mismatched_ret_parent_pollution": {
+            "current_c_parent": c_parent,
+            "expected_after_fix": "",
+            "reproduced": c_parent == "A",
+            "snapshot": mismatch_snapshot,
+        },
+    }
+
+
 # ============================================================
 # LayoutWorker
 # ============================================================
