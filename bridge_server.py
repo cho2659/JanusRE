@@ -566,7 +566,11 @@ class CallTreeBuilder:
     ) -> Optional[str]:
         if not src_mod or src_mod == "unknown":
             return None
-        key = (src_mod.lower(), src_sym.lower(), hex(src_off).lower())
+        sym_base = self._symbol_base(src_sym)
+        if sym_base:
+            key = (src_mod.lower(), "symbol", sym_base)
+        else:
+            key = (src_mod.lower(), "offset", hex(src_off).lower())
         if key in anchors and anchors[key] in nodes:
             return anchors[key]
 
@@ -861,6 +865,24 @@ def _run_calltree_synthetic_checks() -> dict:
     balanced_c_parent = (
         balanced_c_nodes[0]["parent"] if balanced_c_nodes else ""
     )
+    split_anchor_events = [
+        _synthetic_call(
+            1, "app.exe", "0x4a0d", "CHwpSDKSampleDlg::InsertText",
+            "hwpsdk.dll", "0x1570", "HWPSDK::Document::CreateAction",
+            source="target_export"),
+        _synthetic_ret(
+            2, "hwpsdk.dll", "0x1570", "HWPSDK::Document::CreateAction",
+            "app.exe", "0x4a12", "CHwpSDKSampleDlg::InsertText+0x5"),
+        _synthetic_call(
+            3, "app.exe", "0x4a61", "CHwpSDKSampleDlg::InsertText",
+            "hwpsdk.dll", "0x1070", "HWPSDK::Action::CreateParameterSet",
+            source="target_export"),
+    ]
+    split_anchor_snapshot = _calltree_synthetic_snapshot(split_anchor_events)
+    insert_text_nodes = [
+        n for n in split_anchor_snapshot["nodes"]
+        if n["symbol"] == "CHwpSDKSampleDlg::InsertText"
+    ]
     return {
         "mismatched_ret_parent_pollution": {
             "current_c_parent": c_parent,
@@ -874,6 +896,12 @@ def _run_calltree_synthetic_checks() -> dict:
             "expected": "A",
             "passed": balanced_c_parent == "A",
             "snapshot": balanced_snapshot,
+        },
+        "target_export_anchor_merge": {
+            "current_anchor_count": len(insert_text_nodes),
+            "expected": 1,
+            "passed": len(insert_text_nodes) == 1,
+            "snapshot": split_anchor_snapshot,
         },
     }
 
