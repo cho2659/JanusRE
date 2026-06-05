@@ -35,6 +35,8 @@ GitHub Issue: [#4](https://github.com/cho2659/JanusRE/issues/4)
   - `MainWindow` 오른쪽 함수 검색 패널 아래에 `ThreadListPanel` 배치
   - 스레드 목록 더블클릭 signal을 그래프 전환 메서드에 연결
   - 중앙 그래프 영역에서 스레드 탭 표시를 제거하고 단일 그래프 스택으로 전환
+  - 세션 재로드 시 기존 TID를 유지해 첫 스레드로 튀는 현상 방지
+  - 함수 검색 결과 이동 시 대상 노드를 확대 및 포커스
 
 ### 검증
 

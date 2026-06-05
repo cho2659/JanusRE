@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMenu, QFileDialog,
     QMessageBox, QStatusBar, QTreeWidget, QTreeWidgetItem,
     QGraphicsScene, QGraphicsView, QGraphicsItem,
-    QGraphicsPathItem, QTabWidget, QLineEdit,
+    QGraphicsPathItem, QStackedWidget, QLineEdit,
 )
 
 AGENT_JS_PATH      = Path(__file__).parent / "frida_agent" / "agent.js"
@@ -1313,9 +1313,13 @@ class GraphView(QGraphicsView):
             self.fitInView(br.adjusted(-20, -20, 20, 20),
                            Qt.AspectRatioMode.KeepAspectRatio)
 
-    def focus_on(self, node_id: str):
+    def focus_on(self, node_id: str, zoom: bool = False):
         item = self.scene().focus_node(node_id)
         if item:
+            if zoom:
+                self.resetTransform()
+                self._zoom = 1.6
+                self.scale(self._zoom, self._zoom)
             self.centerOn(item)
 
     def reset_zoom(self):
@@ -1502,18 +1506,10 @@ class CallGraphPanel(QWidget):
 
         ly.addWidget(tb)
 
-        # 스레드 탭
-        self._tabs = QTabWidget()
-        self._tabs.setUsesScrollButtons(True)
-        self._tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        # 그래프 뷰 스택. 스레드 선택 UI는 오른쪽 ThreadListPanel에서 담당한다.
+        self._tabs = QStackedWidget()
         self._tabs.setStyleSheet("""
-            QTabWidget::pane{border:1px solid #D1D9E0;background:#F5F5F5;}
-            QTabBar::tab{background:#EEF2F7;color:#6B7280;
-                         padding:5px 14px;border:1px solid #D1D9E0;
-                         border-bottom:none;margin-right:2px;border-radius:3px 3px 0 0;}
-            QTabBar::tab:selected{background:#FFFFFF;color:#1E293B;
-                                  font-weight:bold;border-bottom:2px solid #0078D4;}
-            QTabBar::tab:hover{background:#DBEAFE;color:#1E293B;}
+            QStackedWidget{border:1px solid #D1D9E0;background:#F5F5F5;}
         """)
         self._tabs.currentChanged.connect(self._on_tab_changed)
         ly.addWidget(self._tabs, 1)
@@ -1531,6 +1527,7 @@ class CallGraphPanel(QWidget):
 
     def load_session(self, session):
         """TraceSession 수신 시 호출."""
+        previous_tid = self._current_tid
         builder = CallTreeBuilder(self._symbol_resolver, self._project_files)
         try:
             self._session_data = builder.build(session)
@@ -1541,7 +1538,7 @@ class CallGraphPanel(QWidget):
         self._fit_pending_tids = set()
         self._apply_initial_expansion()
 
-        self._tabs.clear()
+        self._clear_graph_stack()
         self._views.clear()
         self._tab_tids = []
 
@@ -1564,10 +1561,21 @@ class CallGraphPanel(QWidget):
 
         if self._session_data:
             main_tid = self._main_tid()
-            self._current_tid = main_tid
-            self.threads_changed.emit(self.thread_entries(), main_tid)
-            self._relayout(main_tid)
-            self._switch_to_tid(main_tid)
+            target_tid = (
+                previous_tid
+                if previous_tid in self._session_data
+                else main_tid
+            )
+            self._current_tid = target_tid
+            self.threads_changed.emit(self.thread_entries(), target_tid)
+            self._relayout(target_tid)
+            self._switch_to_tid(target_tid)
+
+    def _clear_graph_stack(self):
+        while self._tabs.count():
+            widget = self._tabs.widget(0)
+            self._tabs.removeWidget(widget)
+            widget.setParent(None)
 
     def _apply_initial_expansion(self):
         """모든 노드 기본 접힘 상태. 클릭 시 오른쪽에 자식이 펼쳐짐."""
@@ -1592,7 +1600,7 @@ class CallGraphPanel(QWidget):
         # 스레드가 먼저 이벤트를 낼 수 있어, main 탭 표시가 흔들린다.
         return min(self._session_data.keys())
 
-    def sync_from_ghidra(self, module: str, offset_hex: str):
+    def sync_from_ghidra(self, module: str, offset_hex: str, zoom: bool = False):
         """Ghidra sync → 해당 노드 선택."""
         try:
             offset = int(offset_hex, 16)
@@ -1604,11 +1612,11 @@ class CallGraphPanel(QWidget):
                     self._switch_to_tid(tid)
                     if tid in self._views:
                         _, view = self._views[tid]
-                        view.focus_on(nid)
+                        view.focus_on(nid, zoom=zoom)
                     return
 
-    def goto_node_token(self, token: str):
-        self._on_goto(token)
+    def goto_node_token(self, token: str, zoom: bool = False):
+        self._on_goto(token, zoom=zoom)
 
     def select_thread(self, tid: int):
         if tid not in self._session_data:
@@ -1686,8 +1694,7 @@ class CallGraphPanel(QWidget):
             lambda nid, t=tid: self._on_node_signal(t, nid))
         self._views[tid] = (scene, view)
         self._tab_tids.append(tid)
-        suffix = " (main)" if tid == self._main_tid() else ""
-        self._tabs.addTab(view, "Thread {}{}".format(tid, suffix))
+        self._tabs.addWidget(view)
 
     def _switch_to_tid(self, tid: int):
         if tid in self._tab_tids:
@@ -1894,7 +1901,7 @@ class CallGraphPanel(QWidget):
                 p.expanded = True
             cur = p
 
-    def _on_goto(self, node_id: str):
+    def _on_goto(self, node_id: str, zoom: bool = False):
         tid = self._current_tid
         if "|" in node_id:
             t_s, node_id = node_id.split("|", 1)
@@ -1906,7 +1913,7 @@ class CallGraphPanel(QWidget):
             self._relayout(tid)
         if tid in self._views:
             _, view = self._views[tid]
-            view.focus_on(node_id)
+            view.focus_on(node_id, zoom=zoom)
 
     def _fit_all(self):
         if self._current_tid in self._views:
@@ -3201,7 +3208,15 @@ class MainWindow(QMainWindow):
         self._func_panel = FunctionSearchPanel()
         self._func_panel.set_symbol_resolver(self._resolve_ghidra_symbol)
         self._func_panel.function_selected.connect(self._on_function_selected)
-        right_ly.addWidget(self._func_panel, 1)
+        right_ly.addWidget(self._func_panel, 2)
+
+        self._thread_panel = ThreadListPanel()
+        self._thread_panel.setMinimumHeight(160)
+        self._thread_panel.thread_activated.connect(self._graph.select_thread)
+        self._graph.threads_changed.connect(self._thread_panel.set_threads)
+        self._graph.current_thread_changed.connect(
+            self._thread_panel.set_current_tid)
+        right_ly.addWidget(self._thread_panel, 1)
         right.setMinimumWidth(320)
         right.setMaximumWidth(560)
         h_split.addWidget(right)
@@ -3275,9 +3290,9 @@ class MainWindow(QMainWindow):
 
     def _on_function_selected(self, module: str, offset_hex: str, graph_token: str):
         if graph_token:
-            self._graph.goto_node_token(graph_token)
+            self._graph.goto_node_token(graph_token, zoom=True)
         else:
-            self._graph.sync_from_ghidra(module, offset_hex)
+            self._graph.sync_from_ghidra(module, offset_hex, zoom=True)
         self._on_graph_sync(module, offset_hex)
 
     def _on_ghidra_sync(self, module: str, offset_hex: str):
