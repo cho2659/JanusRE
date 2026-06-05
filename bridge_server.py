@@ -381,6 +381,7 @@ class CallTreeBuilder:
                 stack.append(node_id)
 
             elif ev_type == "ret":
+                ret_match_idx = self._ret_stack_match_index(stack, nodes, ev)
                 if self._is_external_to_target_ret(ev):
                     src_mod = ev.get("src_module", "unknown")
                     src_off = self._hex(ev.get("src_offset", "0x0"))
@@ -392,7 +393,11 @@ class CallTreeBuilder:
                     base_key = "ret_{}+{}".format(dst_mod, hex(dst_off))
                     call_counter[base_key] = call_counter.get(base_key, 0) + 1
                     node_id = "{}_{}".format(base_key, call_counter[base_key])
-                    parent_id = stack[-1] if stack else None
+                    parent_id = (
+                        stack[ret_match_idx]
+                        if ret_match_idx is not None
+                        else None
+                    )
                     depth = (
                         nodes[parent_id].depth + 1
                         if parent_id and parent_id in nodes
@@ -420,10 +425,55 @@ class CallTreeBuilder:
                     else:
                         node.is_entry = True
                     nodes[node_id] = node
-                if stack:
-                    stack.pop()
+                self._unwind_stack_for_ret(stack, ret_match_idx)
 
         return nodes, edges
+
+    def _ret_stack_match_index(
+        self,
+        stack: list[str],
+        nodes: dict[str, CallNode],
+        ev: dict,
+    ) -> Optional[int]:
+        for idx in range(len(stack) - 1, -1, -1):
+            node = nodes.get(stack[idx])
+            if node and self._node_matches_ret(node, ev):
+                return idx
+        return None
+
+    def _node_matches_ret(self, node: CallNode, ev: dict) -> bool:
+        src_mod = str(ev.get("src_module", "") or "").lower()
+        if not src_mod or src_mod == "unknown":
+            return False
+        if (node.module or "").lower() != src_mod:
+            return False
+
+        src_off = self._hex(ev.get("src_offset", "0x0"))
+        if node.offset == src_off:
+            return True
+
+        return (
+            self._symbol_base(node.symbol)
+            and self._symbol_base(node.symbol) == self._symbol_base(
+                ev.get("src_symbol", ""))
+        )
+
+    @staticmethod
+    def _symbol_base(symbol: str) -> str:
+        base = (symbol or "").strip().lower()
+        if "+" in base:
+            base = base.rsplit("+", 1)[0].strip()
+        return base
+
+    @staticmethod
+    def _unwind_stack_for_ret(
+        stack: list[str],
+        ret_match_idx: Optional[int],
+    ):
+        if ret_match_idx is None:
+            stack.clear()
+            return
+        del stack[ret_match_idx:]
 
     def _build_placeholder_thread(
         self, tid: int, spawn_ev: Optional[dict],
@@ -797,12 +847,33 @@ def _run_calltree_synthetic_checks() -> dict:
         if n["symbol"] == "C"
     ]
     c_parent = c_nodes[0]["parent"] if c_nodes else ""
+    balanced_events = [
+        _synthetic_call(1, "unknown", "0x0", "", "app.exe", "0x100", "A"),
+        _synthetic_call(2, "app.exe", "0x110", "A+0x10", "app.exe", "0x200", "B"),
+        _synthetic_ret(3, "app.exe", "0x200", "B", "app.exe", "0x118", "A+0x18"),
+        _synthetic_call(4, "app.exe", "0x120", "A+0x20", "app.exe", "0x300", "C"),
+    ]
+    balanced_snapshot = _calltree_synthetic_snapshot(balanced_events)
+    balanced_c_nodes = [
+        n for n in balanced_snapshot["nodes"]
+        if n["symbol"] == "C"
+    ]
+    balanced_c_parent = (
+        balanced_c_nodes[0]["parent"] if balanced_c_nodes else ""
+    )
     return {
         "mismatched_ret_parent_pollution": {
             "current_c_parent": c_parent,
             "expected_after_fix": "",
             "reproduced": c_parent == "A",
+            "passed": c_parent == "",
             "snapshot": mismatch_snapshot,
+        },
+        "balanced_nested_parent": {
+            "current_c_parent": balanced_c_parent,
+            "expected": "A",
+            "passed": balanced_c_parent == "A",
+            "snapshot": balanced_snapshot,
         },
     }
 
