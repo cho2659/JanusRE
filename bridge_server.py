@@ -1389,6 +1389,61 @@ class SearchPanel(QWidget):
 
 
 # ============================================================
+# ThreadListPanel
+# ============================================================
+
+class ThreadListPanel(QWidget):
+    thread_activated = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        ly = QVBoxLayout(self)
+        ly.setContentsMargins(4, 4, 4, 4)
+        ly.setSpacing(4)
+
+        lbl = QLabel("스레드")
+        lbl.setStyleSheet("font-weight:bold;color:#1E293B;")
+        ly.addWidget(lbl)
+
+        self._list = QListWidget()
+        self._list.setUniformItemSizes(True)
+        self._list.itemDoubleClicked.connect(self._activate)
+        self._list.setStyleSheet(
+            "background:#FFFFFF;color:#1E293B;"
+            "border:1px solid #D1D9E0;border-radius:3px;")
+        ly.addWidget(self._list, 1)
+
+    def set_threads(self, threads: list[dict], current_tid: Optional[int] = None):
+        self._list.clear()
+        for entry in threads:
+            tid = int(entry.get("tid", 0))
+            suffix = "  main" if entry.get("main") else ""
+            node_count = int(entry.get("node_count", 0))
+            item = QListWidgetItem(
+                "TID {}{}  ({} nodes)".format(tid, suffix, node_count))
+            item.setData(Qt.ItemDataRole.UserRole, tid)
+            self._list.addItem(item)
+        self.set_current_tid(current_tid)
+
+    def set_current_tid(self, tid: Optional[int]):
+        if tid is None:
+            self._list.clearSelection()
+            return
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == tid:
+                self._list.setCurrentRow(row)
+                self._list.scrollToItem(item)
+                return
+
+    def _activate(self, item: QListWidgetItem):
+        tid = item.data(Qt.ItemDataRole.UserRole)
+        if tid is None:
+            return
+        self.thread_activated.emit(int(tid))
+
+
+# ============================================================
 # CallGraphPanel  ← MainWindow에서 사용
 # ============================================================
 
@@ -1399,6 +1454,8 @@ class CallGraphPanel(QWidget):
     annotate_requested = Signal()
     xref_requested = Signal()
     symbol_modules_requested = Signal(list)
+    threads_changed = Signal(list, object)
+    current_thread_changed = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1489,6 +1546,9 @@ class CallGraphPanel(QWidget):
         self._tab_tids = []
 
         if not self._session_data:
+            self._current_tid = None
+            self.threads_changed.emit([], None)
+            self.current_thread_changed.emit(None)
             self._tabs.hide()
             self._placeholder.setText(
                 "트레이스 데이터가 없습니다.\n"
@@ -1505,6 +1565,7 @@ class CallGraphPanel(QWidget):
         if self._session_data:
             main_tid = self._main_tid()
             self._current_tid = main_tid
+            self.threads_changed.emit(self.thread_entries(), main_tid)
             self._relayout(main_tid)
             self._switch_to_tid(main_tid)
 
@@ -1548,6 +1609,30 @@ class CallGraphPanel(QWidget):
 
     def goto_node_token(self, token: str):
         self._on_goto(token)
+
+    def select_thread(self, tid: int):
+        if tid not in self._session_data:
+            return
+        self._switch_to_tid(tid)
+        scene, _ = self._views.get(tid, (None, None))
+        scene_empty = bool(scene is not None and not scene._node_items)
+        if tid not in self._rendered_tids or scene_empty:
+            self._relayout(tid)
+        self.current_thread_changed.emit(tid)
+
+    def thread_entries(self) -> list[dict]:
+        if not self._session_data:
+            return []
+        main_tid = self._main_tid()
+        entries: list[dict] = []
+        for tid in sorted(self._session_data.keys()):
+            nodes, _ = self._session_data[tid]
+            entries.append({
+                "tid": tid,
+                "main": tid == main_tid,
+                "node_count": len(nodes),
+            })
+        return entries
 
     def function_entries(self) -> list[dict]:
         counts: dict[tuple[str, str], int] = {}
@@ -1607,6 +1692,7 @@ class CallGraphPanel(QWidget):
     def _switch_to_tid(self, tid: int):
         if tid in self._tab_tids:
             self._tabs.setCurrentIndex(self._tab_tids.index(tid))
+            self.current_thread_changed.emit(tid)
 
     # ── 레이아웃 ────────────────────────────────────────────
 
@@ -1697,6 +1783,7 @@ class CallGraphPanel(QWidget):
             return
         if idx < len(self._tab_tids):
             self._current_tid = self._tab_tids[idx]
+            self.current_thread_changed.emit(self._current_tid)
             scene, _ = self._views.get(self._current_tid, (None, None))
             scene_empty = bool(scene is not None and not scene._node_items)
             if self._current_tid not in self._rendered_tids or scene_empty:
