@@ -33,6 +33,7 @@ trace/
 traces/
 *.trace
 *.log
+trace_example/
 
 # IDE / OS
 .idea/
