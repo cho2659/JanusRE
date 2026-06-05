@@ -1058,17 +1058,11 @@ class NodeItem(QGraphicsItem):
 
     Type = QGraphicsItem.UserType + 1
 
-    # 노드 클릭 시 씬으로 알리기 위한 콜백 (씬에서 주입)
-    on_selected_cb = None   # callable(node_id)
-    on_activated_cb = None  # callable(node_id)
-    on_toggle_cb   = None   # callable(node_id)
-
     def __init__(self, node: CallNode, nodes_ref: dict[str, CallNode]):
         super().__init__()
         self._node     = node
         self._nodes    = nodes_ref
         self._searched = False
-        self._toggle_hotspots: list[tuple[QRectF, str]] = []
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         # 디버깅용: 레이아웃/edge anchor 문제를 눈으로 확인하기 위해
         # 노드를 직접 끌어 옮길 수 있게 한다. 이동하면 itemChange()에서
@@ -1097,7 +1091,6 @@ class NodeItem(QGraphicsItem):
         h = self._calc_height()
         w = NODE_W
         sel = self.isSelected()
-        self._toggle_hotspots = []
 
         # 배경색
         if n.is_entry:       bg = C_NODE_ENTRY
@@ -1149,37 +1142,21 @@ class NodeItem(QGraphicsItem):
         painter.drawLine(PAD, y + 2, w - PAD, y + 2)
         y += 6
 
-        # 하위 호출 목록 (1단계)
-        # 현재 구현:
-        #   - 부모 카드 안의 각 하위 항목은 실제 scene에 존재하는 child 노드와
-        #     같은 개념이다. 텍스트 목록만 있고 실제 노드가 없는 상태를 만들지 않는다.
-        #   - 하위 항목 순서는 호출 순서(call_seq)이며 EdgeItem.refresh()도
-        #     같은 순서와 같은 y 좌표 계산을 사용한다.
-        #
-        # 원래 작동해야 하는 방식:
-        #   - 이 목록의 각 줄이 개별 anchor가 된다.
-        #   - 특정 줄을 클릭하면 해당 child 노드로 focus/expand 동작이 이어진다.
-        #   - edge는 아래 EdgeItem.refresh()에서 이 줄의 y 좌표를 그대로
-        #     사용해 시작해야 한다.
+        # 하위 호출 목록은 edge anchor 위치를 보여주기 위한 정적 표시다.
+        # 클릭/더블클릭/펼침 동작은 노드 위치 이동 문제 때문에 제거했다.
         vis_ch = ordered_child_ids(n, self._nodes)
         if vis_ch:
             painter.setFont(FONT_SUB)
             painter.setPen(QPen(C_TEXT_SUB))
-            state = "[펼침]" if n.expanded else "[+]"
-            self._toggle_hotspots.append(
-                (QRectF(x, y, w - PAD * 2, LINE_H), n.node_id))
             painter.drawText(x, y + LINE_H - 2,
-                             "하위/다음({}) {}".format(len(vis_ch), state))
+                             "하위/다음({})".format(len(vis_ch)))
             y += LINE_H
             painter.setFont(FONT_ADDR)
             for cid in vis_ch:
                 cn = self._nodes.get(cid)
                 if not cn: continue
-                arrow = "v" if cn.expanded else ">"
                 painter.setPen(QPen(C_TEXT_SUB))
-                painter.drawText(x + 6, y + LINE_H - 2, arrow)
-                self._toggle_hotspots.append(
-                    (QRectF(x + 2, y, w - PAD * 2 - 2, LINE_H), cid))
+                painter.drawText(x + 6, y + LINE_H - 2, ">")
                 painter.setPen(QPen(C_TEXT_FUNC if cn.symbol else C_TEXT_ADDR))
                 cl = cn.label()
                 if len(cl) > 30: cl = cl[:27] + "…"
@@ -1197,9 +1174,6 @@ class NodeItem(QGraphicsItem):
             spawn_lbl = "⤷ Thread {} 생성".format(n.spawn_tid)
             if sym:
                 spawn_lbl += "  {}".format(sym)
-            self._toggle_hotspots.append(
-                (QRectF(x, footer_y - LINE_H, w - PAD * 2, LINE_H),
-                 "__spawn__:{}".format(n.spawn_tid)))
             painter.drawText(x, footer_y - 2, spawn_lbl)
             footer_y -= LINE_H
 
@@ -1218,48 +1192,13 @@ class NodeItem(QGraphicsItem):
             if start_lbl and start_lbl != n.label():
                 if len(start_lbl) > 18: start_lbl = start_lbl[:15] + "…"
                 by_lbl += " -> {}".format(start_lbl)
-            self._toggle_hotspots.append(
-                (QRectF(x, footer_y - LINE_H, w - PAD * 2, LINE_H),
-                 "__spawned_by__:{}".format(n.spawned_by_tid)))
             painter.drawText(x, footer_y - 2, by_lbl)
 
     def mouseDoubleClickEvent(self, event):
-        if self.on_activated_cb:
-            pos = event.position() if hasattr(event, "position") else event.pos()
-            for rect, token in self._toggle_hotspots:
-                if rect.contains(pos):
-                    self.on_activated_cb(token)
-                    event.accept()
-                    return
-            self.on_activated_cb(self._node.node_id)
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
+        event.accept()
 
     def mousePressEvent(self, event):
-        pos = event.position() if hasattr(event, "position") else event.pos()
-        for rect, token in self._toggle_hotspots:
-            if rect.contains(pos):
-                if token.startswith("__spawn__:") or token.startswith("__spawned_by__:"):
-                    if self.on_activated_cb:
-                        self.on_activated_cb(token)
-                    event.accept()
-                    return
-                target = self._nodes.get(token)
-                if target:
-                    if token != self._node.node_id:
-                        self._node.expanded = True
-                    target.expanded = not target.expanded
-                    # boundingRect 크기가 변할 수 있으므로 알림
-                    self.prepareGeometryChange()
-                    self.update()
-                    if self.on_toggle_cb:
-                        self.on_toggle_cb(target.node_id)
-                    event.accept()
-                    return
         super().mousePressEvent(event)
-        if self.on_selected_cb:
-            self.on_selected_cb(self._node.node_id)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -1403,9 +1342,6 @@ class GraphScene(QGraphicsScene):
         for nid in visible:
             n = nodes[nid]
             item = NodeItem(n, nodes)
-            item.on_selected_cb = self.node_selected.emit
-            item.on_activated_cb = lambda nid_: self.node_selected.emit("__activate__:" + nid_)
-            item.on_toggle_cb   = lambda nid_: self.node_selected.emit("__toggle__:" + nid_)
             self.addItem(item)
             self._node_items[nid] = item
 
@@ -1714,7 +1650,7 @@ class CallGraphPanel(QWidget):
         # 플레이스홀더
         self._placeholder = QLabel(
             "트레이스 완료 후 그래프가 표시됩니다.\n"
-            "클릭: 펼치기/접기  |  더블클릭: Ghidra 이동  |  가운데 버튼: 이동")
+            "가운데 버튼: 이동  |  마우스 휠: 확대/축소")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet("color:#9CA3AF;font-size:13px;")
         ly.addWidget(self._placeholder)
@@ -1995,15 +1931,7 @@ class CallGraphPanel(QWidget):
 
     def _on_node_signal(self, tid: int, signal: str):
         """씬에서 오는 node_selected 시그널 처리."""
-        if signal.startswith("__toggle__:"):
-            node_id = signal[len("__toggle__:"):]
-            # expanded는 NodeItem.mousePressEvent에서 이미 토글됨
-            nodes, _ = self._session_data.get(tid, ({}, []))
-            mods = self._modules_around(nodes, node_id)
-            if mods:
-                self.symbol_modules_requested.emit(mods)
-            self._relayout(tid, fit=False)  # 접기/펼치기 시 뷰 위치 유지
-        elif signal.startswith("__activate__:"):
+        if signal.startswith("__activate__:"):
             inner = signal[len("__activate__:"):]
             if inner.startswith("__spawn__:"):
                 # spawn 링크 클릭 → 자식 스레드 탭으로 이동
