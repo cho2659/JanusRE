@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMenu, QFileDialog,
     QMessageBox, QStatusBar, QTreeWidget, QTreeWidgetItem,
     QGraphicsScene, QGraphicsView, QGraphicsItem,
-    QGraphicsPathItem, QTabWidget, QLineEdit,
+    QGraphicsPathItem, QStackedWidget, QLineEdit,
 )
 
 AGENT_JS_PATH      = Path(__file__).parent / "frida_agent" / "agent.js"
@@ -381,6 +381,7 @@ class CallTreeBuilder:
                 stack.append(node_id)
 
             elif ev_type == "ret":
+                ret_match_idx = self._ret_stack_match_index(stack, nodes, ev)
                 if self._is_external_to_target_ret(ev):
                     src_mod = ev.get("src_module", "unknown")
                     src_off = self._hex(ev.get("src_offset", "0x0"))
@@ -392,7 +393,11 @@ class CallTreeBuilder:
                     base_key = "ret_{}+{}".format(dst_mod, hex(dst_off))
                     call_counter[base_key] = call_counter.get(base_key, 0) + 1
                     node_id = "{}_{}".format(base_key, call_counter[base_key])
-                    parent_id = stack[-1] if stack else None
+                    parent_id = (
+                        stack[ret_match_idx]
+                        if ret_match_idx is not None
+                        else None
+                    )
                     depth = (
                         nodes[parent_id].depth + 1
                         if parent_id and parent_id in nodes
@@ -420,10 +425,55 @@ class CallTreeBuilder:
                     else:
                         node.is_entry = True
                     nodes[node_id] = node
-                if stack:
-                    stack.pop()
+                self._unwind_stack_for_ret(stack, ret_match_idx)
 
         return nodes, edges
+
+    def _ret_stack_match_index(
+        self,
+        stack: list[str],
+        nodes: dict[str, CallNode],
+        ev: dict,
+    ) -> Optional[int]:
+        for idx in range(len(stack) - 1, -1, -1):
+            node = nodes.get(stack[idx])
+            if node and self._node_matches_ret(node, ev):
+                return idx
+        return None
+
+    def _node_matches_ret(self, node: CallNode, ev: dict) -> bool:
+        src_mod = str(ev.get("src_module", "") or "").lower()
+        if not src_mod or src_mod == "unknown":
+            return False
+        if (node.module or "").lower() != src_mod:
+            return False
+
+        src_off = self._hex(ev.get("src_offset", "0x0"))
+        if node.offset == src_off:
+            return True
+
+        return (
+            self._symbol_base(node.symbol)
+            and self._symbol_base(node.symbol) == self._symbol_base(
+                ev.get("src_symbol", ""))
+        )
+
+    @staticmethod
+    def _symbol_base(symbol: str) -> str:
+        base = (symbol or "").strip().lower()
+        if "+" in base:
+            base = base.rsplit("+", 1)[0].strip()
+        return base
+
+    @staticmethod
+    def _unwind_stack_for_ret(
+        stack: list[str],
+        ret_match_idx: Optional[int],
+    ):
+        if ret_match_idx is None:
+            stack.clear()
+            return
+        del stack[ret_match_idx:]
 
     def _build_placeholder_thread(
         self, tid: int, spawn_ev: Optional[dict],
@@ -516,7 +566,11 @@ class CallTreeBuilder:
     ) -> Optional[str]:
         if not src_mod or src_mod == "unknown":
             return None
-        key = (src_mod.lower(), src_sym.lower(), hex(src_off).lower())
+        sym_base = self._symbol_base(src_sym)
+        if sym_base:
+            key = (src_mod.lower(), "symbol", sym_base)
+        else:
+            key = (src_mod.lower(), "offset", hex(src_off).lower())
         if key in anchors and anchors[key] in nodes:
             return anchors[key]
 
@@ -709,6 +763,149 @@ class CallTreeBuilder:
         return child_root.label()
 
 
+class _SyntheticTraceSession:
+    def __init__(self, events: list[dict]):
+        self.events = events
+        self.sync_events: list[dict] = []
+        self.spawn_events: list[dict] = []
+
+
+def _synthetic_call(seq: int, src_mod: str, src_off: str, src_sym: str,
+                    dst_mod: str, dst_off: str, dst_sym: str,
+                    tid: int = 1, source: str = "synthetic") -> dict:
+    return {
+        "type": "call",
+        "thread_id": tid,
+        "seq": seq,
+        "src_module": src_mod,
+        "src_offset": src_off,
+        "src_symbol": src_sym,
+        "dst_module": dst_mod,
+        "dst_offset": dst_off,
+        "dst_symbol": dst_sym,
+        "source": source,
+    }
+
+
+def _synthetic_ret(seq: int, src_mod: str, src_off: str, src_sym: str,
+                   dst_mod: str, dst_off: str, dst_sym: str,
+                   tid: int = 1, source: str = "synthetic") -> dict:
+    return {
+        "type": "ret",
+        "thread_id": tid,
+        "seq": seq,
+        "src_module": src_mod,
+        "src_offset": src_off,
+        "src_symbol": src_sym,
+        "dst_module": dst_mod,
+        "dst_offset": dst_off,
+        "dst_symbol": dst_sym,
+        "source": source,
+    }
+
+
+def _calltree_synthetic_snapshot(events: list[dict],
+                                 target_modules: Optional[list[str]] = None
+                                 ) -> dict:
+    session = _SyntheticTraceSession(events)
+    built = CallTreeBuilder(target_modules=target_modules or ["app.exe"]).build(
+        session)
+    nodes, edges = built.get(1, ({}, []))
+    return {
+        "nodes": [
+            {
+                "id": nid,
+                "symbol": n.symbol,
+                "parent": nodes[n.parent_id].symbol if n.parent_id in nodes else "",
+                "depth": n.depth,
+                "seq": n.trace_seq,
+            }
+            for nid, n in sorted(nodes.items(), key=lambda item: item[1].call_seq)
+        ],
+        "edges": [
+            {
+                "src": nodes[e.src_id].symbol if e.src_id in nodes else e.src_id,
+                "dst": nodes[e.dst_id].symbol if e.dst_id in nodes else e.dst_id,
+                "kind": e.kind,
+            }
+            for e in edges
+        ],
+    }
+
+
+def _run_calltree_synthetic_checks() -> dict:
+    """Manual diagnostic entrypoint for CallTreeBuilder parent false positives.
+
+    Run with:
+      .venv\\Scripts\\python.exe -c "import bridge_server as b; print(b._run_calltree_synthetic_checks())"
+    """
+    mismatch_events = [
+        _synthetic_call(1, "unknown", "0x0", "", "app.exe", "0x100", "A"),
+        _synthetic_call(2, "app.exe", "0x110", "A+0x10", "app.exe", "0x200", "B"),
+        _synthetic_ret(3, "app.exe", "0x100", "A", "unknown", "0x0", ""),
+        _synthetic_call(4, "unknown", "0x0", "", "app.exe", "0x300", "C"),
+    ]
+    mismatch_snapshot = _calltree_synthetic_snapshot(mismatch_events)
+    c_nodes = [
+        n for n in mismatch_snapshot["nodes"]
+        if n["symbol"] == "C"
+    ]
+    c_parent = c_nodes[0]["parent"] if c_nodes else ""
+    balanced_events = [
+        _synthetic_call(1, "unknown", "0x0", "", "app.exe", "0x100", "A"),
+        _synthetic_call(2, "app.exe", "0x110", "A+0x10", "app.exe", "0x200", "B"),
+        _synthetic_ret(3, "app.exe", "0x200", "B", "app.exe", "0x118", "A+0x18"),
+        _synthetic_call(4, "app.exe", "0x120", "A+0x20", "app.exe", "0x300", "C"),
+    ]
+    balanced_snapshot = _calltree_synthetic_snapshot(balanced_events)
+    balanced_c_nodes = [
+        n for n in balanced_snapshot["nodes"]
+        if n["symbol"] == "C"
+    ]
+    balanced_c_parent = (
+        balanced_c_nodes[0]["parent"] if balanced_c_nodes else ""
+    )
+    split_anchor_events = [
+        _synthetic_call(
+            1, "app.exe", "0x4a0d", "CHwpSDKSampleDlg::InsertText",
+            "hwpsdk.dll", "0x1570", "HWPSDK::Document::CreateAction",
+            source="target_export"),
+        _synthetic_ret(
+            2, "hwpsdk.dll", "0x1570", "HWPSDK::Document::CreateAction",
+            "app.exe", "0x4a12", "CHwpSDKSampleDlg::InsertText+0x5"),
+        _synthetic_call(
+            3, "app.exe", "0x4a61", "CHwpSDKSampleDlg::InsertText",
+            "hwpsdk.dll", "0x1070", "HWPSDK::Action::CreateParameterSet",
+            source="target_export"),
+    ]
+    split_anchor_snapshot = _calltree_synthetic_snapshot(split_anchor_events)
+    insert_text_nodes = [
+        n for n in split_anchor_snapshot["nodes"]
+        if n["symbol"] == "CHwpSDKSampleDlg::InsertText"
+    ]
+    return {
+        "mismatched_ret_parent_pollution": {
+            "current_c_parent": c_parent,
+            "expected_after_fix": "",
+            "reproduced": c_parent == "A",
+            "passed": c_parent == "",
+            "snapshot": mismatch_snapshot,
+        },
+        "balanced_nested_parent": {
+            "current_c_parent": balanced_c_parent,
+            "expected": "A",
+            "passed": balanced_c_parent == "A",
+            "snapshot": balanced_snapshot,
+        },
+        "target_export_anchor_merge": {
+            "current_anchor_count": len(insert_text_nodes),
+            "expected": 1,
+            "passed": len(insert_text_nodes) == 1,
+            "snapshot": split_anchor_snapshot,
+        },
+    }
+
+
 # ============================================================
 # LayoutWorker
 # ============================================================
@@ -861,17 +1058,11 @@ class NodeItem(QGraphicsItem):
 
     Type = QGraphicsItem.UserType + 1
 
-    # 노드 클릭 시 씬으로 알리기 위한 콜백 (씬에서 주입)
-    on_selected_cb = None   # callable(node_id)
-    on_activated_cb = None  # callable(node_id)
-    on_toggle_cb   = None   # callable(node_id)
-
     def __init__(self, node: CallNode, nodes_ref: dict[str, CallNode]):
         super().__init__()
         self._node     = node
         self._nodes    = nodes_ref
         self._searched = False
-        self._toggle_hotspots: list[tuple[QRectF, str]] = []
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         # 디버깅용: 레이아웃/edge anchor 문제를 눈으로 확인하기 위해
         # 노드를 직접 끌어 옮길 수 있게 한다. 이동하면 itemChange()에서
@@ -900,7 +1091,6 @@ class NodeItem(QGraphicsItem):
         h = self._calc_height()
         w = NODE_W
         sel = self.isSelected()
-        self._toggle_hotspots = []
 
         # 배경색
         if n.is_entry:       bg = C_NODE_ENTRY
@@ -952,37 +1142,21 @@ class NodeItem(QGraphicsItem):
         painter.drawLine(PAD, y + 2, w - PAD, y + 2)
         y += 6
 
-        # 하위 호출 목록 (1단계)
-        # 현재 구현:
-        #   - 부모 카드 안의 각 하위 항목은 실제 scene에 존재하는 child 노드와
-        #     같은 개념이다. 텍스트 목록만 있고 실제 노드가 없는 상태를 만들지 않는다.
-        #   - 하위 항목 순서는 호출 순서(call_seq)이며 EdgeItem.refresh()도
-        #     같은 순서와 같은 y 좌표 계산을 사용한다.
-        #
-        # 원래 작동해야 하는 방식:
-        #   - 이 목록의 각 줄이 개별 anchor가 된다.
-        #   - 특정 줄을 클릭하면 해당 child 노드로 focus/expand 동작이 이어진다.
-        #   - edge는 아래 EdgeItem.refresh()에서 이 줄의 y 좌표를 그대로
-        #     사용해 시작해야 한다.
+        # 하위 호출 목록은 edge anchor 위치를 보여주기 위한 정적 표시다.
+        # 클릭/더블클릭/펼침 동작은 노드 위치 이동 문제 때문에 제거했다.
         vis_ch = ordered_child_ids(n, self._nodes)
         if vis_ch:
             painter.setFont(FONT_SUB)
             painter.setPen(QPen(C_TEXT_SUB))
-            state = "[펼침]" if n.expanded else "[+]"
-            self._toggle_hotspots.append(
-                (QRectF(x, y, w - PAD * 2, LINE_H), n.node_id))
             painter.drawText(x, y + LINE_H - 2,
-                             "하위/다음({}) {}".format(len(vis_ch), state))
+                             "하위/다음({})".format(len(vis_ch)))
             y += LINE_H
             painter.setFont(FONT_ADDR)
             for cid in vis_ch:
                 cn = self._nodes.get(cid)
                 if not cn: continue
-                arrow = "v" if cn.expanded else ">"
                 painter.setPen(QPen(C_TEXT_SUB))
-                painter.drawText(x + 6, y + LINE_H - 2, arrow)
-                self._toggle_hotspots.append(
-                    (QRectF(x + 2, y, w - PAD * 2 - 2, LINE_H), cid))
+                painter.drawText(x + 6, y + LINE_H - 2, ">")
                 painter.setPen(QPen(C_TEXT_FUNC if cn.symbol else C_TEXT_ADDR))
                 cl = cn.label()
                 if len(cl) > 30: cl = cl[:27] + "…"
@@ -1000,9 +1174,6 @@ class NodeItem(QGraphicsItem):
             spawn_lbl = "⤷ Thread {} 생성".format(n.spawn_tid)
             if sym:
                 spawn_lbl += "  {}".format(sym)
-            self._toggle_hotspots.append(
-                (QRectF(x, footer_y - LINE_H, w - PAD * 2, LINE_H),
-                 "__spawn__:{}".format(n.spawn_tid)))
             painter.drawText(x, footer_y - 2, spawn_lbl)
             footer_y -= LINE_H
 
@@ -1021,48 +1192,13 @@ class NodeItem(QGraphicsItem):
             if start_lbl and start_lbl != n.label():
                 if len(start_lbl) > 18: start_lbl = start_lbl[:15] + "…"
                 by_lbl += " -> {}".format(start_lbl)
-            self._toggle_hotspots.append(
-                (QRectF(x, footer_y - LINE_H, w - PAD * 2, LINE_H),
-                 "__spawned_by__:{}".format(n.spawned_by_tid)))
             painter.drawText(x, footer_y - 2, by_lbl)
 
     def mouseDoubleClickEvent(self, event):
-        if self.on_activated_cb:
-            pos = event.position() if hasattr(event, "position") else event.pos()
-            for rect, token in self._toggle_hotspots:
-                if rect.contains(pos):
-                    self.on_activated_cb(token)
-                    event.accept()
-                    return
-            self.on_activated_cb(self._node.node_id)
-            event.accept()
-            return
-        super().mouseDoubleClickEvent(event)
+        event.accept()
 
     def mousePressEvent(self, event):
-        pos = event.position() if hasattr(event, "position") else event.pos()
-        for rect, token in self._toggle_hotspots:
-            if rect.contains(pos):
-                if token.startswith("__spawn__:") or token.startswith("__spawned_by__:"):
-                    if self.on_activated_cb:
-                        self.on_activated_cb(token)
-                    event.accept()
-                    return
-                target = self._nodes.get(token)
-                if target:
-                    if token != self._node.node_id:
-                        self._node.expanded = True
-                    target.expanded = not target.expanded
-                    # boundingRect 크기가 변할 수 있으므로 알림
-                    self.prepareGeometryChange()
-                    self.update()
-                    if self.on_toggle_cb:
-                        self.on_toggle_cb(target.node_id)
-                    event.accept()
-                    return
         super().mousePressEvent(event)
-        if self.on_selected_cb:
-            self.on_selected_cb(self._node.node_id)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
@@ -1206,9 +1342,6 @@ class GraphScene(QGraphicsScene):
         for nid in visible:
             n = nodes[nid]
             item = NodeItem(n, nodes)
-            item.on_selected_cb = self.node_selected.emit
-            item.on_activated_cb = lambda nid_: self.node_selected.emit("__activate__:" + nid_)
-            item.on_toggle_cb   = lambda nid_: self.node_selected.emit("__toggle__:" + nid_)
             self.addItem(item)
             self._node_items[nid] = item
 
@@ -1313,9 +1446,13 @@ class GraphView(QGraphicsView):
             self.fitInView(br.adjusted(-20, -20, 20, 20),
                            Qt.AspectRatioMode.KeepAspectRatio)
 
-    def focus_on(self, node_id: str):
+    def focus_on(self, node_id: str, zoom: bool = False):
         item = self.scene().focus_node(node_id)
         if item:
+            if zoom:
+                self.resetTransform()
+                self._zoom = 1.6
+                self.scale(self._zoom, self._zoom)
             self.centerOn(item)
 
     def reset_zoom(self):
@@ -1389,6 +1526,61 @@ class SearchPanel(QWidget):
 
 
 # ============================================================
+# ThreadListPanel
+# ============================================================
+
+class ThreadListPanel(QWidget):
+    thread_activated = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        ly = QVBoxLayout(self)
+        ly.setContentsMargins(4, 4, 4, 4)
+        ly.setSpacing(4)
+
+        lbl = QLabel("스레드")
+        lbl.setStyleSheet("font-weight:bold;color:#1E293B;")
+        ly.addWidget(lbl)
+
+        self._list = QListWidget()
+        self._list.setUniformItemSizes(True)
+        self._list.itemDoubleClicked.connect(self._activate)
+        self._list.setStyleSheet(
+            "background:#FFFFFF;color:#1E293B;"
+            "border:1px solid #D1D9E0;border-radius:3px;")
+        ly.addWidget(self._list, 1)
+
+    def set_threads(self, threads: list[dict], current_tid: Optional[int] = None):
+        self._list.clear()
+        for entry in threads:
+            tid = int(entry.get("tid", 0))
+            suffix = "  main" if entry.get("main") else ""
+            node_count = int(entry.get("node_count", 0))
+            item = QListWidgetItem(
+                "TID {}{}  ({} nodes)".format(tid, suffix, node_count))
+            item.setData(Qt.ItemDataRole.UserRole, tid)
+            self._list.addItem(item)
+        self.set_current_tid(current_tid)
+
+    def set_current_tid(self, tid: Optional[int]):
+        if tid is None:
+            self._list.clearSelection()
+            return
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == tid:
+                self._list.setCurrentRow(row)
+                self._list.scrollToItem(item)
+                return
+
+    def _activate(self, item: QListWidgetItem):
+        tid = item.data(Qt.ItemDataRole.UserRole)
+        if tid is None:
+            return
+        self.thread_activated.emit(int(tid))
+
+
+# ============================================================
 # CallGraphPanel  ← MainWindow에서 사용
 # ============================================================
 
@@ -1399,6 +1591,8 @@ class CallGraphPanel(QWidget):
     annotate_requested = Signal()
     xref_requested = Signal()
     symbol_modules_requested = Signal(list)
+    threads_changed = Signal(list, object)
+    current_thread_changed = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1445,18 +1639,10 @@ class CallGraphPanel(QWidget):
 
         ly.addWidget(tb)
 
-        # 스레드 탭
-        self._tabs = QTabWidget()
-        self._tabs.setUsesScrollButtons(True)
-        self._tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        # 그래프 뷰 스택. 스레드 선택 UI는 오른쪽 ThreadListPanel에서 담당한다.
+        self._tabs = QStackedWidget()
         self._tabs.setStyleSheet("""
-            QTabWidget::pane{border:1px solid #D1D9E0;background:#F5F5F5;}
-            QTabBar::tab{background:#EEF2F7;color:#6B7280;
-                         padding:5px 14px;border:1px solid #D1D9E0;
-                         border-bottom:none;margin-right:2px;border-radius:3px 3px 0 0;}
-            QTabBar::tab:selected{background:#FFFFFF;color:#1E293B;
-                                  font-weight:bold;border-bottom:2px solid #0078D4;}
-            QTabBar::tab:hover{background:#DBEAFE;color:#1E293B;}
+            QStackedWidget{border:1px solid #D1D9E0;background:#F5F5F5;}
         """)
         self._tabs.currentChanged.connect(self._on_tab_changed)
         ly.addWidget(self._tabs, 1)
@@ -1464,7 +1650,7 @@ class CallGraphPanel(QWidget):
         # 플레이스홀더
         self._placeholder = QLabel(
             "트레이스 완료 후 그래프가 표시됩니다.\n"
-            "클릭: 펼치기/접기  |  더블클릭: Ghidra 이동  |  가운데 버튼: 이동")
+            "가운데 버튼: 이동  |  마우스 휠: 확대/축소")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setStyleSheet("color:#9CA3AF;font-size:13px;")
         ly.addWidget(self._placeholder)
@@ -1474,6 +1660,7 @@ class CallGraphPanel(QWidget):
 
     def load_session(self, session):
         """TraceSession 수신 시 호출."""
+        previous_tid = self._current_tid
         builder = CallTreeBuilder(self._symbol_resolver, self._project_files)
         try:
             self._session_data = builder.build(session)
@@ -1484,11 +1671,14 @@ class CallGraphPanel(QWidget):
         self._fit_pending_tids = set()
         self._apply_initial_expansion()
 
-        self._tabs.clear()
+        self._clear_graph_stack()
         self._views.clear()
         self._tab_tids = []
 
         if not self._session_data:
+            self._current_tid = None
+            self.threads_changed.emit([], None)
+            self.current_thread_changed.emit(None)
             self._tabs.hide()
             self._placeholder.setText(
                 "트레이스 데이터가 없습니다.\n"
@@ -1504,9 +1694,21 @@ class CallGraphPanel(QWidget):
 
         if self._session_data:
             main_tid = self._main_tid()
-            self._current_tid = main_tid
-            self._relayout(main_tid)
-            self._switch_to_tid(main_tid)
+            target_tid = (
+                previous_tid
+                if previous_tid in self._session_data
+                else main_tid
+            )
+            self._current_tid = target_tid
+            self.threads_changed.emit(self.thread_entries(), target_tid)
+            self._relayout(target_tid)
+            self._switch_to_tid(target_tid)
+
+    def _clear_graph_stack(self):
+        while self._tabs.count():
+            widget = self._tabs.widget(0)
+            self._tabs.removeWidget(widget)
+            widget.setParent(None)
 
     def _apply_initial_expansion(self):
         """모든 노드 기본 접힘 상태. 클릭 시 오른쪽에 자식이 펼쳐짐."""
@@ -1531,7 +1733,7 @@ class CallGraphPanel(QWidget):
         # 스레드가 먼저 이벤트를 낼 수 있어, main 탭 표시가 흔들린다.
         return min(self._session_data.keys())
 
-    def sync_from_ghidra(self, module: str, offset_hex: str):
+    def sync_from_ghidra(self, module: str, offset_hex: str, zoom: bool = False):
         """Ghidra sync → 해당 노드 선택."""
         try:
             offset = int(offset_hex, 16)
@@ -1543,11 +1745,35 @@ class CallGraphPanel(QWidget):
                     self._switch_to_tid(tid)
                     if tid in self._views:
                         _, view = self._views[tid]
-                        view.focus_on(nid)
+                        view.focus_on(nid, zoom=zoom)
                     return
 
-    def goto_node_token(self, token: str):
-        self._on_goto(token)
+    def goto_node_token(self, token: str, zoom: bool = False):
+        self._on_goto(token, zoom=zoom)
+
+    def select_thread(self, tid: int):
+        if tid not in self._session_data:
+            return
+        self._switch_to_tid(tid)
+        scene, _ = self._views.get(tid, (None, None))
+        scene_empty = bool(scene is not None and not scene._node_items)
+        if tid not in self._rendered_tids or scene_empty:
+            self._relayout(tid)
+        self.current_thread_changed.emit(tid)
+
+    def thread_entries(self) -> list[dict]:
+        if not self._session_data:
+            return []
+        main_tid = self._main_tid()
+        entries: list[dict] = []
+        for tid in sorted(self._session_data.keys()):
+            nodes, _ = self._session_data[tid]
+            entries.append({
+                "tid": tid,
+                "main": tid == main_tid,
+                "node_count": len(nodes),
+            })
+        return entries
 
     def function_entries(self) -> list[dict]:
         counts: dict[tuple[str, str], int] = {}
@@ -1601,12 +1827,12 @@ class CallGraphPanel(QWidget):
             lambda nid, t=tid: self._on_node_signal(t, nid))
         self._views[tid] = (scene, view)
         self._tab_tids.append(tid)
-        suffix = " (main)" if tid == self._main_tid() else ""
-        self._tabs.addTab(view, "Thread {}{}".format(tid, suffix))
+        self._tabs.addWidget(view)
 
     def _switch_to_tid(self, tid: int):
         if tid in self._tab_tids:
             self._tabs.setCurrentIndex(self._tab_tids.index(tid))
+            self.current_thread_changed.emit(tid)
 
     # ── 레이아웃 ────────────────────────────────────────────
 
@@ -1697,6 +1923,7 @@ class CallGraphPanel(QWidget):
             return
         if idx < len(self._tab_tids):
             self._current_tid = self._tab_tids[idx]
+            self.current_thread_changed.emit(self._current_tid)
             scene, _ = self._views.get(self._current_tid, (None, None))
             scene_empty = bool(scene is not None and not scene._node_items)
             if self._current_tid not in self._rendered_tids or scene_empty:
@@ -1704,15 +1931,7 @@ class CallGraphPanel(QWidget):
 
     def _on_node_signal(self, tid: int, signal: str):
         """씬에서 오는 node_selected 시그널 처리."""
-        if signal.startswith("__toggle__:"):
-            node_id = signal[len("__toggle__:"):]
-            # expanded는 NodeItem.mousePressEvent에서 이미 토글됨
-            nodes, _ = self._session_data.get(tid, ({}, []))
-            mods = self._modules_around(nodes, node_id)
-            if mods:
-                self.symbol_modules_requested.emit(mods)
-            self._relayout(tid, fit=False)  # 접기/펼치기 시 뷰 위치 유지
-        elif signal.startswith("__activate__:"):
+        if signal.startswith("__activate__:"):
             inner = signal[len("__activate__:"):]
             if inner.startswith("__spawn__:"):
                 # spawn 링크 클릭 → 자식 스레드 탭으로 이동
@@ -1807,7 +2026,7 @@ class CallGraphPanel(QWidget):
                 p.expanded = True
             cur = p
 
-    def _on_goto(self, node_id: str):
+    def _on_goto(self, node_id: str, zoom: bool = False):
         tid = self._current_tid
         if "|" in node_id:
             t_s, node_id = node_id.split("|", 1)
@@ -1819,7 +2038,7 @@ class CallGraphPanel(QWidget):
             self._relayout(tid)
         if tid in self._views:
             _, view = self._views[tid]
-            view.focus_on(node_id)
+            view.focus_on(node_id, zoom=zoom)
 
     def _fit_all(self):
         if self._current_tid in self._views:
@@ -3114,7 +3333,15 @@ class MainWindow(QMainWindow):
         self._func_panel = FunctionSearchPanel()
         self._func_panel.set_symbol_resolver(self._resolve_ghidra_symbol)
         self._func_panel.function_selected.connect(self._on_function_selected)
-        right_ly.addWidget(self._func_panel, 1)
+        right_ly.addWidget(self._func_panel, 2)
+
+        self._thread_panel = ThreadListPanel()
+        self._thread_panel.setMinimumHeight(160)
+        self._thread_panel.thread_activated.connect(self._graph.select_thread)
+        self._graph.threads_changed.connect(self._thread_panel.set_threads)
+        self._graph.current_thread_changed.connect(
+            self._thread_panel.set_current_tid)
+        right_ly.addWidget(self._thread_panel, 1)
         right.setMinimumWidth(320)
         right.setMaximumWidth(560)
         h_split.addWidget(right)
@@ -3188,9 +3415,9 @@ class MainWindow(QMainWindow):
 
     def _on_function_selected(self, module: str, offset_hex: str, graph_token: str):
         if graph_token:
-            self._graph.goto_node_token(graph_token)
+            self._graph.goto_node_token(graph_token, zoom=True)
         else:
-            self._graph.sync_from_ghidra(module, offset_hex)
+            self._graph.sync_from_ghidra(module, offset_hex, zoom=True)
         self._on_graph_sync(module, offset_hex)
 
     def _on_ghidra_sync(self, module: str, offset_hex: str):
