@@ -195,7 +195,7 @@ class CallEdge:
     def __init__(self, src_id: str, dst_id: str, kind: str, tid: int):
         self.src_id = src_id
         self.dst_id = dst_id
-        self.kind   = kind   # "call" | "sync" | "spawn" | "flow"
+        self.kind   = kind   # "call" | "jump" | "sync" | "spawn" | "flow"
         self.tid    = tid
 
 
@@ -209,7 +209,8 @@ class CallTreeBuilder:
     부모-자식 관계 원칙:
       - 부모는 같은 TID의 동적 call stack top으로만 결정한다.
       - call 이벤트: 현재 stack top이 부모이고, 새 dst 함수가 자식이다.
-      - ret 이벤트: 현재 stack top을 pop한다.
+      - jump 이벤트: 현재 stack top이 부모이고, 새 dst 함수가 자식이나 stack push하지 않는다.
+      - ret 이벤트: 그래프에 그리지 않고 현재 stack top을 pop한다.
       - stack이 비어 있을 때 나온 call은 새 root다.
       - 시간상 다음 root를 부모/자식으로 연결하지 않는다.
 
@@ -227,7 +228,7 @@ class CallTreeBuilder:
         # 스레드별 이벤트 분리
         by_tid: dict[int, list[dict]] = {}
         for ev in session.events:
-            if ev.get("type") not in ("call", "ret"):
+            if ev.get("type") not in ("call", "ret", "jump"):
                 continue
             if not self._is_graph_event(ev):
                 continue
@@ -253,11 +254,20 @@ class CallTreeBuilder:
             if s.get("child_tid") is not None:
                 spawn_tids.add(int(s.get("child_tid")))
 
-        for tid in sorted(set(by_tid.keys()) | set(sync_by_tid.keys()) | spawn_tids):
+        exception_by_tid: dict[int, list[dict]] = {}
+        for ev in getattr(session, "exception_events", []):
+            tid = ev.get("tid", 0)
+            exception_by_tid.setdefault(tid, []).append(ev)
+
+        for tid in sorted(
+            set(by_tid.keys()) | set(sync_by_tid.keys())
+            | set(exception_by_tid.keys()) | spawn_tids
+        ):
             events = by_tid.get(tid, [])
             nodes, edges = self._build_thread(
                 tid, events,
                 sync_by_tid.get(tid, []),
+                exception_by_tid.get(tid, []),
             )
             if not nodes:
                 nodes, edges = self._build_placeholder_thread(
@@ -270,17 +280,23 @@ class CallTreeBuilder:
     def _build_thread(
         self, tid: int, events: list[dict],
         sync_events: list[dict],
+        exception_events: list[dict],
     ) -> tuple[dict, list]:
         nodes: dict[str, CallNode] = {}
         edges: list[CallEdge]      = []
         stack: list[str]           = []
         call_counter: dict[str, int] = {}
         caller_anchors: dict[tuple[str, str, str], str] = {}
+        last_external_node: Optional[str] = None
+        last_outbound: Optional[dict] = None
+        exception_since_outbound = False
         call_seq = 0
 
         timeline = (
             [(ev.get("seq", i), "trace", ev) for i, ev in enumerate(events)]
             + [(ev.get("seq", i), "sync", ev) for i, ev in enumerate(sync_events)]
+            + [(ev.get("seq", i), "exception", ev)
+               for i, ev in enumerate(exception_events)]
         )
         timeline.sort(key=lambda item: item[0])
 
@@ -307,9 +323,13 @@ class CallTreeBuilder:
                     node.is_entry = True
                 nodes[node_id] = node
                 continue
+            if item_kind == "exception":
+                if last_outbound:
+                    exception_since_outbound = True
+                continue
 
             ev_type = ev.get("type")
-            if ev_type == "call":
+            if ev_type in ("call", "jump"):
                 src_mod = ev.get("src_module", "unknown")
                 src_off = self._hex(ev.get("src_offset", "0x0"))
                 src_sym = ev.get("src_symbol", "")
@@ -324,11 +344,27 @@ class CallTreeBuilder:
                 if not dst_sym:
                     dst_sym = self._display_symbol(
                         dst_mod, ev.get("dst_offset", "0x0"))
+                src_tt = self._event_target_flag(ev, "src_tt", src_mod)
+                dst_tt = self._event_target_flag(ev, "dst_tt", dst_mod)
+                if not src_tt and not dst_tt:
+                    continue
 
                 base_key = "{}+{}".format(dst_mod, hex(dst_off))
                 call_counter[base_key] = call_counter.get(base_key, 0) + 1
                 node_id = "{}_{}".format(base_key, call_counter[base_key])
                 parent_id = stack[-1] if stack else None
+                inbound_from_external = not src_tt and dst_tt
+                tunnel_parent = (
+                    inbound_from_external
+                    and last_external_node
+                    and not exception_since_outbound
+                    and self._tunnel_inbound_matches(last_outbound, ev)
+                )
+                if tunnel_parent:
+                    parent_id = last_external_node
+                elif (inbound_from_external and last_external_node
+                      and exception_since_outbound):
+                    parent_id = None
                 if ev.get("source") == "target_export":
                     parent_id = self._source_anchor_node(
                         nodes, caller_anchors, tid, src_mod, src_off, src_sym,
@@ -373,58 +409,38 @@ class CallTreeBuilder:
                     node.parent_id = parent_id
                     if parent_id in nodes:
                         nodes[parent_id].children_ids.append(node_id)
-                    edges.append(CallEdge(parent_id, node_id, "call", tid))
+                    edges.append(CallEdge(parent_id, node_id, ev_type, tid))
                 else:
                     node.is_entry = True
 
                 nodes[node_id] = node
-                stack.append(node_id)
+                if src_tt and not dst_tt:
+                    last_external_node = node_id
+                    last_outbound = ev
+                    exception_since_outbound = False
+                elif tunnel_parent:
+                    last_external_node = None
+                    last_outbound = None
+                    exception_since_outbound = False
+                elif inbound_from_external and exception_since_outbound:
+                    last_external_node = None
+                    last_outbound = None
+                    exception_since_outbound = False
+                elif src_tt:
+                    last_external_node = None
+                    last_outbound = None
+                    exception_since_outbound = False
+
+                if ev_type == "call":
+                    stack.append(node_id)
 
             elif ev_type == "ret":
                 ret_match_idx = self._ret_stack_match_index(stack, nodes, ev)
-                if self._is_external_to_target_ret(ev):
-                    src_mod = ev.get("src_module", "unknown")
-                    src_off = self._hex(ev.get("src_offset", "0x0"))
-                    src_sym = ev.get("src_symbol", "")
-                    dst_mod = ev.get("dst_module", "unknown")
-                    dst_off = self._hex(ev.get("dst_offset", "0x0"))
-                    dst_sym = ev.get("dst_symbol", "")
-
-                    base_key = "ret_{}+{}".format(dst_mod, hex(dst_off))
-                    call_counter[base_key] = call_counter.get(base_key, 0) + 1
-                    node_id = "{}_{}".format(base_key, call_counter[base_key])
-                    parent_id = (
-                        stack[ret_match_idx]
-                        if ret_match_idx is not None
-                        else None
-                    )
-                    depth = (
-                        nodes[parent_id].depth + 1
-                        if parent_id and parent_id in nodes
-                        else len(stack)
-                    )
-                    node = CallNode(
-                        node_id=node_id,
-                        module=dst_mod,
-                        symbol=dst_sym,
-                        offset=dst_off,
-                        tid=tid,
-                        call_seq=call_seq,
-                        depth=depth,
-                    )
-                    node.trace_seq = ev.get("seq", call_seq)
-                    node.src_module = src_mod
-                    node.src_offset = src_off
-                    node.src_symbol = src_sym
-                    call_seq += 1
-                    if parent_id:
-                        node.parent_id = parent_id
-                        if parent_id in nodes:
-                            nodes[parent_id].children_ids.append(node_id)
-                        edges.append(CallEdge(parent_id, node_id, "flow", tid))
-                    else:
-                        node.is_entry = True
-                    nodes[node_id] = node
+                if (not exception_since_outbound
+                        and self._ret_closes_outbound(last_outbound, ev)):
+                    last_external_node = None
+                    last_outbound = None
+                    exception_since_outbound = False
                 self._unwind_stack_for_ret(stack, ret_match_idx)
 
         return nodes, edges
@@ -613,6 +629,63 @@ class CallTreeBuilder:
             and self._is_target_module(ev.get("dst_module", ""))
         )
 
+    def _event_target_flag(self, ev: dict, field: str, module: str) -> bool:
+        if field in ev:
+            return bool(ev.get(field))
+        return self._is_target_module(module)
+
+    def _same_module_offset(
+        self,
+        left_mod: str,
+        left_off,
+        right_mod: str,
+        right_off,
+    ) -> bool:
+        if not left_mod or not right_mod:
+            return False
+        if left_mod == "unknown" or right_mod == "unknown":
+            return False
+        if left_mod.lower() != right_mod.lower():
+            return False
+        return self._hex(left_off) == self._hex(right_off)
+
+    def _tunnel_inbound_matches(
+        self,
+        outbound: Optional[dict],
+        inbound: dict,
+    ) -> bool:
+        if not outbound:
+            return False
+        if self._same_module_offset(
+            outbound.get("dst_module", ""),
+            outbound.get("dst_offset", "0x0"),
+            inbound.get("src_module", ""),
+            inbound.get("src_offset", "0x0"),
+        ):
+            return True
+
+        inbound_src_tt = self._event_target_flag(
+            inbound, "src_tt", inbound.get("src_module", ""))
+        inbound_dst_tt = self._event_target_flag(
+            inbound, "dst_tt", inbound.get("dst_module", ""))
+        return not inbound_src_tt and inbound_dst_tt
+
+    def _ret_closes_outbound(
+        self,
+        outbound: Optional[dict],
+        ret_ev: dict,
+    ) -> bool:
+        if not outbound or ret_ev.get("type") != "ret":
+            return False
+        if not self._is_external_to_target_ret(ret_ev):
+            return False
+        return self._same_module_offset(
+            outbound.get("src_module", ""),
+            outbound.get("src_offset", "0x0"),
+            ret_ev.get("dst_module", ""),
+            ret_ev.get("dst_offset", "0x0"),
+        )
+
     @staticmethod
     def _normalize_targets(modules: list[str]) -> set[str]:
         out: set[str] = set()
@@ -768,6 +841,7 @@ class _SyntheticTraceSession:
         self.events = events
         self.sync_events: list[dict] = []
         self.spawn_events: list[dict] = []
+        self.exception_events: list[dict] = []
 
 
 def _synthetic_call(seq: int, src_mod: str, src_off: str, src_sym: str,
@@ -804,10 +878,24 @@ def _synthetic_ret(seq: int, src_mod: str, src_off: str, src_sym: str,
     }
 
 
+def _synthetic_jump(seq: int, src_mod: str, src_off: str, src_sym: str,
+                    dst_mod: str, dst_off: str, dst_sym: str,
+                    tid: int = 1, source: str = "synthetic") -> dict:
+    ev = _synthetic_call(
+        seq, src_mod, src_off, src_sym,
+        dst_mod, dst_off, dst_sym,
+        tid=tid, source=source)
+    ev["type"] = "jump"
+    ev["is_jump"] = True
+    return ev
+
+
 def _calltree_synthetic_snapshot(events: list[dict],
-                                 target_modules: Optional[list[str]] = None
+                                 target_modules: Optional[list[str]] = None,
+                                 exception_events: Optional[list[dict]] = None,
                                  ) -> dict:
     session = _SyntheticTraceSession(events)
+    session.exception_events = exception_events or []
     built = CallTreeBuilder(target_modules=target_modules or ["app.exe"]).build(
         session)
     nodes, edges = built.get(1, ({}, []))
@@ -883,6 +971,33 @@ def _run_calltree_synthetic_checks() -> dict:
         n for n in split_anchor_snapshot["nodes"]
         if n["symbol"] == "CHwpSDKSampleDlg::InsertText"
     ]
+    tunnel_events = [
+        _synthetic_call(1, "unknown", "0x0", "", "app.exe", "0x100", "A"),
+        _synthetic_call(2, "app.exe", "0x110", "A+0x10",
+                        "kernel32.dll", "0x500", "K32"),
+        _synthetic_jump(3, "kernel32.dll", "0x500", "K32",
+                        "app.exe", "0x200", "B"),
+    ]
+    tunnel_snapshot = _calltree_synthetic_snapshot(tunnel_events)
+    tunnel_edges = tunnel_snapshot["edges"]
+    ret_only_events = [
+        _synthetic_call(1, "unknown", "0x0", "", "app.exe", "0x100", "A"),
+        _synthetic_call(2, "app.exe", "0x110", "A+0x10",
+                        "kernel32.dll", "0x500", "K32"),
+        _synthetic_ret(3, "kernel32.dll", "0x500", "K32",
+                       "app.exe", "0x118", "A+0x18"),
+    ]
+    ret_only_snapshot = _calltree_synthetic_snapshot(ret_only_events)
+    exception_snapshot = _calltree_synthetic_snapshot(
+        tunnel_events,
+        exception_events=[{
+            "seq": 2.5,
+            "tid": 1,
+            "address": "0xDEAD",
+            "exception_type": "access-violation",
+        }],
+    )
+    exception_tunnel_edges = exception_snapshot["edges"]
     return {
         "mismatched_ret_parent_pollution": {
             "current_c_parent": c_parent,
@@ -902,6 +1017,26 @@ def _run_calltree_synthetic_checks() -> dict:
             "expected": 1,
             "passed": len(insert_text_nodes) == 1,
             "snapshot": split_anchor_snapshot,
+        },
+        "same_thread_tunnel": {
+            "expected_edge": ("K32", "B", "jump"),
+            "passed": any(
+                e["src"] == "K32" and e["dst"] == "B"
+                and e["kind"] == "jump"
+                for e in tunnel_edges),
+            "snapshot": tunnel_snapshot,
+        },
+        "ret_not_rendered": {
+            "expected_node_count": 2,
+            "passed": len(ret_only_snapshot["nodes"]) == 2,
+            "snapshot": ret_only_snapshot,
+        },
+        "exception_suppresses_tunnel": {
+            "expected_no_tunnel_edge": ("K32", "B"),
+            "passed": not any(
+                e["src"] == "K32" and e["dst"] == "B"
+                for e in exception_tunnel_edges),
+            "snapshot": exception_snapshot,
         },
     }
 
@@ -2303,6 +2438,7 @@ class TraceSession:
         self.sync_events:  list[dict] = []
         self.spawn_events: list[dict] = []
         self.handle_events: list[dict] = []
+        self.exception_events: list[dict] = []
         self.modules:      list[str]  = []
         self.reason = ""
         self.saved  = False
@@ -2328,6 +2464,7 @@ class TraceSession:
             "sync_events":  self.sync_events,
             "spawn_events": self.spawn_events,
             "handle_events": self.handle_events,
+            "exception_events": self.exception_events,
             "modules":      self.modules,
             "reason":       self.reason,
         }
@@ -2343,6 +2480,7 @@ class TraceSession:
         s.sync_events  = d.get("sync_events", [])
         s.spawn_events = d.get("spawn_events", [])
         s.handle_events = d.get("handle_events", [])
+        s.exception_events = d.get("exception_events", [])
         s.modules      = d.get("modules", [])
         s.reason       = d.get("reason", "loaded")
         s.saved        = True
@@ -2390,6 +2528,7 @@ class FridaWorker(QObject):
         self._chunk_sync_events: list[dict] = []
         self._chunk_spawn_events: list[dict] = []
         self._chunk_handle_events: list[dict] = []
+        self._chunk_exception_events: list[dict] = []
         self._session_id: Optional[str] = None
 
     def start_trace(self):
@@ -2578,6 +2717,7 @@ class FridaWorker(QObject):
                 or self._chunk_sync_events
                 or self._chunk_spawn_events
                 or self._chunk_handle_events
+                or self._chunk_exception_events
             )
 
     def _append_trace_payload(self, pl: dict):
@@ -2588,7 +2728,7 @@ class FridaWorker(QObject):
                 sent_at_ms = int(time.time() * 1000)
             for key in (
                 "events", "mod_events", "sync_events",
-                "spawn_events", "handle_events"):
+                "spawn_events", "handle_events", "exception_events"):
                 for ev in pl.get(key, []):
                     if isinstance(ev, dict) and "sent_at_ms" not in ev:
                         ev["sent_at_ms"] = sent_at_ms
@@ -2597,12 +2737,15 @@ class FridaWorker(QObject):
             self._chunk_sync_events.extend(pl.get("sync_events", []))
             self._chunk_spawn_events.extend(pl.get("spawn_events", []))
             self._chunk_handle_events.extend(pl.get("handle_events", []))
-            dbg("chunk cache totals raw:{} mod:{} sync:{} spawn:{} handle:{}".format(
+            self._chunk_exception_events.extend(
+                pl.get("exception_events", []))
+            dbg("chunk cache totals raw:{} mod:{} sync:{} spawn:{} handle:{} exception:{}".format(
                 len(self._chunk_events),
                 len(self._chunk_mod_events),
                 len(self._chunk_sync_events),
                 len(self._chunk_spawn_events),
-                len(self._chunk_handle_events)))
+                len(self._chunk_handle_events),
+                len(self._chunk_exception_events)))
 
     def _build_session(self, reason: str) -> TraceSession:
         with self._chunk_lock:
@@ -2611,6 +2754,7 @@ class FridaWorker(QObject):
             sync_events = list(self._chunk_sync_events)
             spawn_events = list(self._chunk_spawn_events)
             handle_events = list(self._chunk_handle_events)
+            exception_events = list(self._chunk_exception_events)
             session_id = self._session_id
 
         evs = postprocess(raw, mods)
@@ -2625,6 +2769,7 @@ class FridaWorker(QObject):
         sess.sync_events = sync_events
         sess.spawn_events = spawn_events
         sess.handle_events = handle_events
+        sess.exception_events = exception_events
         sess.modules = names
         sess.reason = reason
         sess.build_graph()

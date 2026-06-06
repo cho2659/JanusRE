@@ -1,5 +1,5 @@
 📦
-23796 /agent.js
+25157 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -25,6 +25,7 @@ var require_agent = __commonJS({
     var g_sync_events = [];
     var g_spawn_events = [];
     var g_handle_events = [];
+    var g_exception_events = [];
     var g_stalked = /* @__PURE__ */ new Set();
     var g_attach_failed = /* @__PURE__ */ new Set();
     var g_seq = 0;
@@ -39,6 +40,8 @@ var require_agent = __commonJS({
     var g_sent_sync_events = 0;
     var g_sent_spawn_events = 0;
     var g_sent_handle_events = 0;
+    var g_sent_exception_events = 0;
+    var g_exception_handler_installed = false;
     var g_symbol_name_by_va = /* @__PURE__ */ new Map();
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_last_block_by_tid = /* @__PURE__ */ new Map();
@@ -584,13 +587,41 @@ var require_agent = __commonJS({
         }
       }
     }
+    function hookExceptions() {
+      if (g_exception_handler_installed)
+        return;
+      g_exception_handler_installed = true;
+      Process.setExceptionHandler((details) => {
+        try {
+          const address = details.address;
+          const mod = address ? findModuleSafe(address) : null;
+          if (g_started) {
+            g_exception_events.push({
+              seq: nextSeq(),
+              tid: Process.getCurrentThreadId(),
+              address: address ? ph(address) : "unknown",
+              exception_type: String(details.type || "unknown"),
+              module: mod ? mod.name : "unknown",
+              offset: address ? moduleOffset(address, mod) : "0x0"
+            });
+          }
+          send({
+            type: "status",
+            text: "exception_marker type=" + String(details.type || "unknown") + " address=" + (address ? ph(address) : "unknown")
+          });
+        } catch (_) {
+        }
+        return false;
+      });
+    }
     function sendTraceChunk(reason) {
       const events = g_events.slice(g_sent_events);
       const modEvents = g_mod_events.slice(g_sent_mod_events);
       const syncEvents = g_sync_events.slice(g_sent_sync_events);
       const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
       const handleEvents = g_handle_events.slice(g_sent_handle_events);
-      if (events.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0) {
+      const exceptionEvents = g_exception_events.slice(g_sent_exception_events);
+      if (events.length === 0 && modEvents.length === 0 && syncEvents.length === 0 && spawnEvents.length === 0 && handleEvents.length === 0 && exceptionEvents.length === 0) {
         return;
       }
       send({
@@ -602,13 +633,15 @@ var require_agent = __commonJS({
         mod_events: modEvents,
         sync_events: syncEvents,
         spawn_events: spawnEvents,
-        handle_events: handleEvents
+        handle_events: handleEvents,
+        exception_events: exceptionEvents
       });
       g_sent_events = g_events.length;
       g_sent_mod_events = g_mod_events.length;
       g_sent_sync_events = g_sync_events.length;
       g_sent_spawn_events = g_spawn_events.length;
       g_sent_handle_events = g_handle_events.length;
+      g_sent_exception_events = g_exception_events.length;
     }
     function flushAndSend(reason, hookName) {
       if (g_flushed)
@@ -632,7 +665,8 @@ var require_agent = __commonJS({
         mod_events: [],
         sync_events: [],
         spawn_events: [],
-        handle_events: []
+        handle_events: [],
+        exception_events: []
       });
     }
     rpc.exports = {
@@ -689,6 +723,7 @@ var require_agent = __commonJS({
         g_targets.add(normalizedTargetName(mainMod.name));
       hookModules();
       hookThreadCreation();
+      hookExceptions();
       hookExit();
     })();
   }

@@ -190,12 +190,13 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
 - ret는 Stalker ret callout 또는 기존 ret event 경로로 확인한다.
 - ret도 classifier를 통과한다.
   - 둘 다 `tf`이면 기록하지 않는다.
-  - `tf -> tt` ret는 external return 후보로 본다.
-  - `tt -> tf` ret는 target에서 외부로 나가는 흐름이므로 external node 또는 stack unwind에 반영한다.
-- ret 대응은 outbound `src`와 inbound `dst` 대조를 우선한다.
+  - `tf -> tt` ret는 external return 검증 후보로만 본다.
+  - `tt -> tf` ret는 target에서 외부로 나가는 흐름이지만 별도 node/edge로 표시하지 않는다.
+- ret는 그래프를 그릴 때 도움이 되는 보조 정보이며, ret 자체를 별도 node/edge로 그리지 않는다.
+- ret 대응은 outbound `src`와 inbound `dst` 대조를 우선하되, tunnel 오탐 억제와 call stack 정리에만 사용한다.
   - `tt -> tf` outbound ret/call/jump를 저장할 때 outbound `src`는 target caller offset이다.
   - 이후 같은 thread에서 `tf -> tt` inbound ret가 오면 inbound `dst`가 저장된 outbound `src`와 같은 target module/offset인지 확인한다.
-  - 일치하면 외부 호출에서 원래 target caller로 돌아온 것으로 보고 tunnel/return edge를 닫는다.
+  - 일치하면 외부 호출에서 원래 target caller로 돌아온 것으로 보고 tunnel 후보를 닫거나 stack unwind에 반영한다.
   - 불일치하면 ret stack match를 fallback으로 쓰되, 같은 thread 조건은 유지한다.
 - ret matching은 기존 `_ret_stack_match_index()`를 유지하되, jump로 생성된 node는 call stack push 여부를 분리한다.
   - call node는 stack push.
@@ -340,14 +341,15 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
 - thread가 다르면 tunnel 후보를 폐기한다.
 - exception marker가 같은 thread의 outbound/inbound 사이에 있으면 tunnel 치환을 억제한다.
 - `tf -> tf` 이벤트는 agent에서 이미 배제되지만, Python에서도 방어적으로 배제한다.
-- ret 이벤트는 classifier 결과, exception marker, outbound `src`와 inbound `dst` 대조, stack match fallback 순서로 external return edge를 만든다.
+- ret 이벤트는 classifier 결과, exception marker, outbound `src`와 inbound `dst` 대조, stack match fallback 순서로 tunnel 후보와 call stack을 정리한다.
+- ret 이벤트 자체는 별도 그래프 node/edge로 만들지 않는다.
 - 검증:
   - synthetic trace로 같은 thread `tt1 -> tf1 -> tt2` 그래프 확인
   - synthetic trace로 다른 thread tunnel 미적용 확인
-  - outbound `src`와 inbound `dst`가 일치하는 ret 복귀 확인
+  - outbound `src`와 inbound `dst`가 일치하는 ret 복귀가 별도 node/edge 없이 tunnel 후보와 stack만 정리하는지 확인
   - exception marker가 outbound/inbound 사이에 있는 경우 tunnel 미적용 확인
   - `tf -> tf` 노드가 생성되지 않는지 확인
-  - ret 기반 복귀 edge가 기존 call stack을 과도하게 무너뜨리지 않는지 확인
+  - ret가 기존 call stack을 과도하게 무너뜨리지 않는지 확인
 
 ### Stage 9 - 통합 검증과 보고
 
@@ -426,7 +428,7 @@ interface ExceptionEvent {
 - jump 계열은 transform 기반으로 기록된다.
 - 같은 thread의 `tt1 -> tf1 -> tf2 -> tf3 -> tt2` 흐름은 그래프에서 `tt1 -> tf1 -> tt2`로 표시된다.
 - 다른 thread의 `tt -> tf -> tt` 유사 흐름은 tunnel로 치환하지 않는다.
-- ret 복귀는 outbound `src`와 inbound `dst` 대조를 우선해 대응한다.
+- ret 복귀는 outbound `src`와 inbound `dst` 대조를 우선해 대응하되, 별도 그래프 node/edge를 생성하지 않는다.
 - exception marker가 같은 thread의 tunnel 후보 사이에 있으면 tunnel 오탐을 억제한다.
 - `Process.setExceptionHandler()`는 exception을 삼키지 않고 원래 프로세스 예외 처리기로 전달한다.
 - user-level sync/handler Interceptor 신규 구현은 v2로 이월한다.

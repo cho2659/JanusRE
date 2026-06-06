@@ -93,6 +93,15 @@ interface HandleEvent {
   source_gen?: number;
 }
 
+interface ExceptionMarkerEvent {
+  seq: number;
+  tid: number;
+  address: string;
+  exception_type: string;
+  module?: string;
+  offset?: string;
+}
+
 interface AgentPayload {
   type:         "trace_complete" | "trace_chunk";
   session_id:   string;
@@ -103,6 +112,7 @@ interface AgentPayload {
   sync_events:  SyncEvent[];
   spawn_events: ThreadSpawnEvent[];
   handle_events: HandleEvent[];
+  exception_events: ExceptionMarkerEvent[];
 }
 
 type TargetModuleConfig = {
@@ -120,6 +130,7 @@ const g_mod_events:   ModuleEvent[]       = [];
 const g_sync_events:  SyncEvent[]         = [];
 const g_spawn_events: ThreadSpawnEvent[]  = [];
 const g_handle_events: HandleEvent[]      = [];
+const g_exception_events: ExceptionMarkerEvent[] = [];
 const g_stalked:      Set<number>         = new Set();
 const g_attach_failed:Set<number>         = new Set();
 
@@ -135,6 +146,8 @@ let g_sent_mod_events = 0;
 let g_sent_sync_events = 0;
 let g_sent_spawn_events = 0;
 let g_sent_handle_events = 0;
+let g_sent_exception_events = 0;
+let g_exception_handler_installed = false;
 
 const g_handle_gen_by_key: Map<string, number> = new Map();
 let g_next_handle_gen = 1;
@@ -909,6 +922,33 @@ function hookExit(): void {
   }
 }
 
+function hookExceptions(): void {
+  if (g_exception_handler_installed) return;
+  g_exception_handler_installed = true;
+  Process.setExceptionHandler((details: any) => {
+    try {
+      const address = details.address as NativePointer | undefined;
+      const mod = address ? findModuleSafe(address) : null;
+      if (g_started) {
+        g_exception_events.push({
+          seq: nextSeq(),
+          tid: Process.getCurrentThreadId(),
+          address: address ? ph(address) : "unknown",
+          exception_type: String(details.type || "unknown"),
+          module: mod ? mod.name : "unknown",
+          offset: address ? moduleOffset(address, mod) : "0x0",
+        });
+      }
+      send({
+        type: "status",
+        text: "exception_marker type=" + String(details.type || "unknown")
+          + " address=" + (address ? ph(address) : "unknown"),
+      });
+    } catch (_) {}
+    return false;
+  });
+}
+
 // ══════════════════════════════════════════════════════════
 // 데이터 전송
 // ══════════════════════════════════════════════════════════
@@ -919,11 +959,12 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
   const syncEvents = g_sync_events.slice(g_sent_sync_events);
   const spawnEvents = g_spawn_events.slice(g_sent_spawn_events);
   const handleEvents = g_handle_events.slice(g_sent_handle_events);
+  const exceptionEvents = g_exception_events.slice(g_sent_exception_events);
 
   if (
     events.length === 0 && modEvents.length === 0
     && syncEvents.length === 0 && spawnEvents.length === 0
-    && handleEvents.length === 0
+    && handleEvents.length === 0 && exceptionEvents.length === 0
   ) {
     return;
   }
@@ -935,6 +976,7 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
     mod_events: modEvents, sync_events: syncEvents,
     spawn_events: spawnEvents,
     handle_events: handleEvents,
+    exception_events: exceptionEvents,
   } as AgentPayload);
 
   g_sent_events = g_events.length;
@@ -942,6 +984,7 @@ function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
   g_sent_sync_events = g_sync_events.length;
   g_sent_spawn_events = g_spawn_events.length;
   g_sent_handle_events = g_handle_events.length;
+  g_sent_exception_events = g_exception_events.length;
 }
 
 function flushAndSend(reason: "exit" | "user_stop", hookName?: string): void {
@@ -967,6 +1010,7 @@ function flushAndSend(reason: "exit" | "user_stop", hookName?: string): void {
     mod_events: [], sync_events: [],
     spawn_events: [],
     handle_events: [],
+    exception_events: [],
   } as AgentPayload);
 }
 
@@ -1038,5 +1082,6 @@ rpc.exports = {
 
   hookModules();
   hookThreadCreation();
+  hookExceptions();
   hookExit();
 })();
