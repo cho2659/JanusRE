@@ -1,5 +1,5 @@
 📦
-25467 /agent.js
+26281 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -44,6 +44,7 @@ var require_agent = __commonJS({
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_export_symbols_by_module = /* @__PURE__ */ new Map();
     var g_targets = /* @__PURE__ */ new Set();
+    var g_function_starts_by_module = /* @__PURE__ */ new Map();
     var SESSION_ID = generateUUID();
     var MAX_BT = 24;
     var FAILURE_SCAN_DELAY_MS = 50;
@@ -728,6 +729,26 @@ var require_agent = __commonJS({
           g_targets.add(normalizedTargetName(mainMod.name));
         hookLoadedTargetExports();
         send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
+      },
+      setTargetConfig(configs) {
+        g_targets = /* @__PURE__ */ new Set();
+        g_function_starts_by_module.clear();
+        for (const cfg of configs) {
+          if (!cfg.trace)
+            continue;
+          const name = normalizedTargetName(cfg.name);
+          g_targets.add(name);
+          g_function_starts_by_module.set(name, (cfg.function_starts || []).map((v) => String(v)));
+        }
+        hookLoadedTargetExports();
+        let starts = 0;
+        for (const offsets of g_function_starts_by_module.values()) {
+          starts += offsets.length;
+        }
+        send({
+          type: "status",
+          text: "target_config modules=" + Array.from(g_targets).join(",") + " function_starts=" + starts
+        });
       }
     };
     (function main() {

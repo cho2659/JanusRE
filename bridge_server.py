@@ -2361,10 +2361,16 @@ class FridaWorker(QObject):
     target_spawned = Signal(int, str)
     finished = Signal()
 
-    def __init__(self, target_path: str, project_files: list[str]):
+    def __init__(
+        self,
+        target_path: str,
+        project_files: list[str],
+        target_configs: Optional[list[dict]] = None,
+    ):
         super().__init__()
         self._target        = target_path
         self._project_files = project_files
+        self._target_configs = target_configs or []
         self._session       = None
         self._script        = None
         self._pid           = None
@@ -2418,7 +2424,13 @@ class FridaWorker(QObject):
             dbg("script.load begin")
             self._script.load()
             dbg("script.load ok")
-            if self._project_files:
+            if self._target_configs:
+                dbg("set_target_config begin: count={}".format(
+                    len(self._target_configs)))
+                self._script.exports_sync.set_target_config(
+                    self._target_configs)
+                dbg("set_target_config ok")
+            elif self._project_files:
                 dbg("set_targets begin: count={}".format(len(self._project_files)))
                 self._script.exports_sync.set_targets(self._project_files)
                 dbg("set_targets ok")
@@ -2874,6 +2886,36 @@ class GhidraServerWorker(QObject):
     def refresh_symbols_for_module(self, mod: str, refresh: bool = True) -> int:
         return len(self._symbols_for_module(mod, refresh=refresh))
 
+    def target_function_configs(self, modules: list[str]) -> list[dict]:
+        configs: list[dict] = []
+        for mod in modules:
+            symbols = self._symbols_for_module_no_timeout(mod, refresh=True)
+            configs.append({
+                "name": mod,
+                "trace": True,
+                "function_starts": [
+                    str(sym.get("offset", ""))
+                    for sym in symbols
+                    if sym.get("offset", "")
+                ],
+            })
+        return configs
+
+    def _symbols_for_module_no_timeout(
+        self, mod: str, refresh: bool,
+    ) -> list[dict]:
+        key = self._module_key(mod)
+        if not refresh and key in self._symbol_cache:
+            return self._symbol_cache[key]
+        rsp = self.ghidra_rpc("symbols", {"module": mod}, timeout=None)
+        symbols: list[dict] = []
+        if rsp and rsp.get("ok"):
+            result = rsp.get("result", {})
+            symbols = result.get("symbols", []) if isinstance(result, dict) else []
+        symbols.sort(key=lambda s: self._safe_int(s.get("offset", "0x0")))
+        self._symbol_cache[key] = symbols
+        return symbols
+
     def resolve_symbol(self, mod: str, offset_hex: str) -> str:
         if not mod or mod == "unknown":
             return ""
@@ -2915,7 +2957,7 @@ class GhidraServerWorker(QObject):
     # ── Ghidra RPC (동기) ─────────────────────────────────
 
     def ghidra_rpc(self, method: str, params: dict,
-                   timeout: float = 30.0) -> Optional[dict]:
+                   timeout: Optional[float] = 30.0) -> Optional[dict]:
         with self._lock: conn = self._conn
         if conn is None: return None
         req_id = str(uuid.uuid4())
@@ -3598,6 +3640,9 @@ class MainWindow(QMainWindow):
                 self, "트레이스 대상 없음",
                 "트레이스할 Ghidra 프로젝트 모듈을 하나 이상 체크하세요.")
             return
+        target_configs = self._prepare_target_configs(selected_targets)
+        if target_configs is None:
+            return
         self._session    = TraceSession()
         self._target_pid = None
         self._target_path = str(Path(target_path).resolve())
@@ -3608,7 +3653,8 @@ class MainWindow(QMainWindow):
         self._graph.set_project_files(selected_targets)
         self._func_panel.set_project_files(selected_targets)
 
-        self._frida_worker = FridaWorker(target_path, selected_targets)
+        self._frida_worker = FridaWorker(
+            target_path, selected_targets, target_configs)
         self._frida_thread = QThread()
         worker = self._frida_worker
         thread = self._frida_thread
@@ -3630,6 +3676,33 @@ class MainWindow(QMainWindow):
         self._frida_thread.started.connect(self._frida_worker.start_trace)
         self._frida_thread.start()
         self._st("트레이스 시작: {}".format(target_path))
+
+    def _prepare_target_configs(
+        self, selected_targets: list[str],
+    ) -> Optional[list[dict]]:
+        if not self._ghidra_worker or not self._ghidra_worker.is_connected():
+            self._st("함수 시작점 준비: Ghidra 미연결")
+            QMessageBox.warning(
+                self, "Ghidra 미연결",
+                "함수 시작점 bitmap 준비를 위해 Ghidra 연결이 필요합니다.")
+            return None
+        self._st("함수 시작점 준비 중: {}개 모듈".format(len(selected_targets)))
+        configs = self._ghidra_worker.target_function_configs(selected_targets)
+        missing = [
+            cfg.get("name", "")
+            for cfg in configs
+            if not cfg.get("function_starts")
+        ]
+        if missing:
+            self._st("함수 시작점 없음: {}".format(", ".join(missing)))
+            QMessageBox.warning(
+                self, "함수 시작점 없음",
+                "다음 모듈에서 Ghidra 함수 시작점을 받지 못했습니다:\n{}".format(
+                    "\n".join(missing)))
+            return None
+        total = sum(len(cfg.get("function_starts", [])) for cfg in configs)
+        self._st("함수 시작점 준비 완료: {}개".format(total))
+        return configs
 
     def _on_target_spawned(self, pid: int, target_path: str):
         self._target_pid = int(pid)

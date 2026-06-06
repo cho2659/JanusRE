@@ -104,6 +104,12 @@ interface AgentPayload {
   handle_events: HandleEvent[];
 }
 
+type TargetModuleConfig = {
+  name: string;
+  trace: boolean;
+  function_starts: string[];
+};
+
 // ══════════════════════════════════════════════════════════
 // 전역 상태
 // ══════════════════════════════════════════════════════════
@@ -144,6 +150,7 @@ const g_export_symbols_by_module: Map<string, Array<{ name: string; address: Nat
 
 // 타겟 모듈 집합 (소문자). rpc.setTargets()로 갱신.
 let g_targets: Set<string> = new Set();
+const g_function_starts_by_module: Map<string, string[]> = new Map();
 
 const SESSION_ID  = generateUUID();
 const MAX_BT      = 24; // 콜스택 역추적 최대 깊이
@@ -906,6 +913,28 @@ rpc.exports = {
     if (mainMod) g_targets.add(normalizedTargetName(mainMod.name));
     hookLoadedTargetExports();
     send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
+  },
+
+  setTargetConfig(configs: TargetModuleConfig[]): void {
+    g_targets = new Set();
+    g_function_starts_by_module.clear();
+    for (const cfg of configs) {
+      if (!cfg.trace) continue;
+      const name = normalizedTargetName(cfg.name);
+      g_targets.add(name);
+      g_function_starts_by_module.set(
+        name, (cfg.function_starts || []).map(v => String(v)));
+    }
+    hookLoadedTargetExports();
+    let starts = 0;
+    for (const offsets of g_function_starts_by_module.values()) {
+      starts += offsets.length;
+    }
+    send({
+      type: "status",
+      text: "target_config modules=" + Array.from(g_targets).join(",")
+        + " function_starts=" + starts,
+    });
   },
 };
 
