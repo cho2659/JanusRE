@@ -2115,7 +2115,8 @@ def postprocess(raw_events: list[dict],
         seq    = ev["seq"]
         src_va = int(ev["src"], 16)
         dst_va = int(ev["dst"], 16)
-        kind   = "call" if ev["k"] == 0 else "ret"
+        raw_kind = ev["k"]
+        kind   = "call" if raw_kind == 0 else "ret" if raw_kind == 1 else "jump"
         tid    = ev["tid"]
 
         sm = ev.get("src_module", "")
@@ -2139,6 +2140,7 @@ def postprocess(raw_events: list[dict],
                     "dst_is_external": bool(ev.get("dst_is_external", False)),
                     "src_tt": bool(ev.get("src_tt", False)),
                     "dst_tt": bool(ev.get("dst_tt", False)),
+                    "is_jump": bool(ev.get("is_jump", False)),
                     "source": ev.get("source", ""),
                     "type": kind, "thread_id": tid, "seq": seq})
     return out

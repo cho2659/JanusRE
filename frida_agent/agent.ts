@@ -4,11 +4,9 @@
  * 빌드: frida-compile agent.ts -o agent.js
  *
  * 설계:
- *   - CALL + RET 만 Stalker 추적 (JMP 제외)
+ *   - CALL + RET + JMP 계열 Stalker 추적
  *   - 최적화/필터링보다 누락 방지를 우선한다.
- *   - Stalker call/ret 이벤트는 모듈 필터 없이 기록한다.
- *   - 타겟 모듈 export는 하나씩 Interceptor로도 기록한다.
- *   - 모든 인터셉트는 ntdll / user32 수준
+ *   - Stalker call/ret/jump 이벤트는 tt/tf bitmap으로 필터링한다.
  *   - 메인 EXE 종료만 flush 트리거
  */
 
@@ -19,7 +17,7 @@
 // ══════════════════════════════════════════════════════════
 
 interface RawEvent {
-  k:   0 | 1;   // 0=call, 1=ret
+  k:   0 | 1 | 2;   // 0=call, 1=ret, 2=jump
   src: string;  // 출발지 VA hex "0x..."
   dst: string;  // 목적지 VA hex
   tid: number;
@@ -33,6 +31,7 @@ interface RawEvent {
   dst_is_external?: boolean;
   src_tt?: boolean;
   dst_tt?: boolean;
+  is_jump?: boolean;
   source?: string;
 }
 
@@ -148,7 +147,13 @@ type LastExternalCall = {
   at_ms: number;
 };
 
+type LastBlockState = {
+  last: NativePointer;
+  isJump: boolean;
+};
+
 const g_last_external_call_by_tid: Map<number, LastExternalCall> = new Map();
+const g_last_block_by_tid: Map<number, LastBlockState> = new Map();
 const g_export_symbols_by_module: Map<string, Array<{ name: string; address: NativePointer }>> = new Map();
 
 // 타겟 모듈 집합 (소문자). rpc.setTargets()로 갱신.
@@ -457,6 +462,62 @@ function recordTraceEvent(
   }
 }
 
+function recordJumpEvent(
+  loc: NativePointer,
+  target: NativePointer,
+  tid: number,
+  source: string,
+): void {
+  const srcClass = classifyAddress(loc);
+  const dstClass = classifyAddress(target);
+  if (!srcClass.tt && !dstClass.tt) return;
+  if (dstClass.tt && !dstClass.functionStart) return;
+
+  const srcMod = findModuleSafe(loc);
+  const dstMod = findModuleSafe(target);
+  const out: RawEvent = {
+    k: 2,
+    src: ph(loc), dst: ph(target),
+    tid, seq: nextSeq(),
+    src_module: srcMod ? srcMod.name : "unknown",
+    src_offset: moduleOffset(loc, srcMod),
+    dst_module: dstMod ? dstMod.name : "unknown",
+    dst_offset: moduleOffset(target, dstMod),
+    dst_is_external: srcClass.tt && dstMod !== null && !dstClass.tt,
+    src_tt: srcClass.tt,
+    dst_tt: dstClass.tt,
+    is_jump: true,
+    source,
+  };
+  out.src_symbol = symbolName(loc);
+  out.dst_symbol = symbolName(target);
+  g_events.push(out);
+  if (out.dst_is_external && dstMod) {
+    noteExternalBoundaryCall(tid, loc, target, dstMod);
+  }
+}
+
+function isJumpMnemonic(mnemonic: string): boolean {
+  const m = mnemonic.toLowerCase();
+  return m === "jmp" || /^j[a-z0-9]+$/.test(m);
+}
+
+function recordBlockTransition(
+  tid: number,
+  blockStart: NativePointer,
+  blockLast: NativePointer,
+  blockEndsWithJump: boolean,
+): void {
+  const prev = g_last_block_by_tid.get(tid);
+  if (prev && prev.isJump) {
+    recordJumpEvent(prev.last, blockStart, tid, "stalker_jump");
+  }
+  g_last_block_by_tid.set(tid, {
+    last: blockLast,
+    isJump: blockEndsWithJump,
+  });
+}
+
 function hookTargetExports(mod: Module): void {
   void mod;
 }
@@ -673,6 +734,24 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
     ok = withThreadSuspended(tid, reason, () => {
       Stalker.follow(tid, {
         events: { call: true, ret: true },
+
+        transform(iterator: StalkerArm64Iterator | StalkerArmIterator | StalkerThumbIterator | StalkerX86Iterator): void {
+          let instruction = iterator.next();
+          if (instruction === null) return;
+
+          const blockStart = instruction.address;
+          let blockLast = instruction;
+          do {
+            blockLast = instruction;
+            iterator.keep();
+            instruction = iterator.next();
+          } while (instruction !== null);
+
+          const blockEndsWithJump = isJumpMnemonic(blockLast.mnemonic);
+          iterator.putCallout(() => {
+            recordBlockTransition(tid, blockStart, blockLast.address, blockEndsWithJump);
+          });
+        },
 
         onReceive(evbuf: ArrayBuffer): void {
           const parsed = Stalker.parse(evbuf, {

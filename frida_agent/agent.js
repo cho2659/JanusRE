@@ -1,5 +1,5 @@
 📦
-21485 /agent.js
+23796 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -41,6 +41,7 @@ var require_agent = __commonJS({
     var g_sent_handle_events = 0;
     var g_symbol_name_by_va = /* @__PURE__ */ new Map();
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
+    var g_last_block_by_tid = /* @__PURE__ */ new Map();
     var g_export_symbols_by_module = /* @__PURE__ */ new Map();
     var g_targets = /* @__PURE__ */ new Set();
     var g_function_starts_by_module = /* @__PURE__ */ new Map();
@@ -259,6 +260,52 @@ var require_agent = __commonJS({
         noteExternalBoundaryCall(tid, loc, target, dstMod);
       }
     }
+    function recordJumpEvent(loc, target, tid, source) {
+      const srcClass = classifyAddress(loc);
+      const dstClass = classifyAddress(target);
+      if (!srcClass.tt && !dstClass.tt)
+        return;
+      if (dstClass.tt && !dstClass.functionStart)
+        return;
+      const srcMod = findModuleSafe(loc);
+      const dstMod = findModuleSafe(target);
+      const out = {
+        k: 2,
+        src: ph(loc),
+        dst: ph(target),
+        tid,
+        seq: nextSeq(),
+        src_module: srcMod ? srcMod.name : "unknown",
+        src_offset: moduleOffset(loc, srcMod),
+        dst_module: dstMod ? dstMod.name : "unknown",
+        dst_offset: moduleOffset(target, dstMod),
+        dst_is_external: srcClass.tt && dstMod !== null && !dstClass.tt,
+        src_tt: srcClass.tt,
+        dst_tt: dstClass.tt,
+        is_jump: true,
+        source
+      };
+      out.src_symbol = symbolName(loc);
+      out.dst_symbol = symbolName(target);
+      g_events.push(out);
+      if (out.dst_is_external && dstMod) {
+        noteExternalBoundaryCall(tid, loc, target, dstMod);
+      }
+    }
+    function isJumpMnemonic(mnemonic) {
+      const m = mnemonic.toLowerCase();
+      return m === "jmp" || /^j[a-z0-9]+$/.test(m);
+    }
+    function recordBlockTransition(tid, blockStart, blockLast, blockEndsWithJump) {
+      const prev = g_last_block_by_tid.get(tid);
+      if (prev && prev.isJump) {
+        recordJumpEvent(prev.last, blockStart, tid, "stalker_jump");
+      }
+      g_last_block_by_tid.set(tid, {
+        last: blockLast,
+        isJump: blockEndsWithJump
+      });
+    }
     function hookTargetExports(mod) {
       void mod;
     }
@@ -378,6 +425,22 @@ var require_agent = __commonJS({
         ok = withThreadSuspended(tid, reason, () => {
           Stalker.follow(tid, {
             events: { call: true, ret: true },
+            transform(iterator) {
+              let instruction = iterator.next();
+              if (instruction === null)
+                return;
+              const blockStart = instruction.address;
+              let blockLast = instruction;
+              do {
+                blockLast = instruction;
+                iterator.keep();
+                instruction = iterator.next();
+              } while (instruction !== null);
+              const blockEndsWithJump = isJumpMnemonic(blockLast.mnemonic);
+              iterator.putCallout(() => {
+                recordBlockTransition(tid, blockStart, blockLast.address, blockEndsWithJump);
+              });
+            },
             onReceive(evbuf) {
               const parsed = Stalker.parse(evbuf, {
                 annotate: true,
