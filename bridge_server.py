@@ -2137,6 +2137,8 @@ def postprocess(raw_events: list[dict],
                     "src_symbol": ev.get("src_symbol", ""),
                     "dst_symbol": ev.get("dst_symbol", ""),
                     "dst_is_external": bool(ev.get("dst_is_external", False)),
+                    "src_tt": bool(ev.get("src_tt", False)),
+                    "dst_tt": bool(ev.get("dst_tt", False)),
                     "source": ev.get("source", ""),
                     "type": kind, "thread_id": tid, "seq": seq})
     return out

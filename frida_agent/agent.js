@@ -1,5 +1,5 @@
 📦
-21731 /agent.js
+21485 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -40,11 +40,13 @@ var require_agent = __commonJS({
     var g_sent_spawn_events = 0;
     var g_sent_handle_events = 0;
     var g_symbol_name_by_va = /* @__PURE__ */ new Map();
-    var g_hooked_target_exports = /* @__PURE__ */ new Set();
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
     var g_export_symbols_by_module = /* @__PURE__ */ new Map();
     var g_targets = /* @__PURE__ */ new Set();
     var g_function_starts_by_module = /* @__PURE__ */ new Map();
+    var g_target_module_records = [];
+    var g_classifier_module = null;
+    var g_bitmap_test = null;
     var SESSION_ID = generateUUID();
     var FAILURE_SCAN_DELAY_MS = 50;
     function generateUUID() {
@@ -64,10 +66,89 @@ var require_agent = __commonJS({
       const parts = raw.split("/");
       return parts[parts.length - 1] || raw;
     }
-    function isTarget(mod) {
-      if (!mod)
-        return false;
-      return g_targets.has(normalizedTargetName(mod.name));
+    function ensureClassifier() {
+      if (g_bitmap_test)
+        return;
+      g_classifier_module = new CModule(`
+    int bitmap_test(const unsigned char *bits,
+                    unsigned long long bit_count,
+                    unsigned long long offset) {
+      if (bits == 0 || offset >= bit_count) return 0;
+      return (bits[offset >> 3] >> (offset & 7)) & 1;
+    }
+  `);
+      g_bitmap_test = new NativeFunction(g_classifier_module.bitmap_test, "int", ["pointer", "uint64", "uint64"]);
+    }
+    function pointerOffset(addr, base) {
+      return parseInt(addr.sub(base).toString(16), 16);
+    }
+    function allocBitmap(bitCount, fill, offsets = []) {
+      ensureClassifier();
+      const byteCount = Math.max(1, Math.ceil(Math.max(0, bitCount) / 8));
+      const bytes = new Uint8Array(byteCount);
+      if (fill) {
+        bytes.fill(255);
+      } else {
+        for (const offText of offsets) {
+          const offset = parseInt(String(offText), 16);
+          if (!Number.isFinite(offset) || offset < 0 || offset >= bitCount)
+            continue;
+          const byteIndex = offset >> 3;
+          bytes[byteIndex] = (bytes[byteIndex] || 0) | 1 << (offset & 7);
+        }
+      }
+      const mem = Memory.alloc(byteCount);
+      mem.writeByteArray(bytes.buffer);
+      return mem;
+    }
+    function removeTargetModuleRecord(mod) {
+      for (let i = g_target_module_records.length - 1; i >= 0; i--) {
+        const rec = g_target_module_records[i];
+        if (rec.name === normalizedTargetName(mod.name) && rec.base.equals(mod.base)) {
+          g_target_module_records.splice(i, 1);
+        }
+      }
+    }
+    function refreshTargetModuleRecord(mod) {
+      const name = normalizedTargetName(mod.name);
+      removeTargetModuleRecord(mod);
+      if (!g_targets.has(name))
+        return;
+      const starts = g_function_starts_by_module.get(name) || [];
+      g_target_module_records.push({
+        name,
+        base: mod.base,
+        size: mod.size,
+        targetBits: allocBitmap(mod.size, true),
+        functionBits: allocBitmap(mod.size, false, starts)
+      });
+    }
+    function rebuildTargetModuleRecords() {
+      g_target_module_records.length = 0;
+      for (const mod of Process.enumerateModules()) {
+        refreshTargetModuleRecord(mod);
+      }
+    }
+    function targetRecordForAddress(addr) {
+      if (!addr)
+        return null;
+      for (const rec of g_target_module_records) {
+        if (addr.compare(rec.base) >= 0 && addr.compare(rec.base.add(rec.size)) < 0) {
+          return rec;
+        }
+      }
+      return null;
+    }
+    function classifyAddress(addr) {
+      ensureClassifier();
+      const rec = targetRecordForAddress(addr);
+      if (!addr || !rec || !g_bitmap_test) {
+        return { tt: false, functionStart: false };
+      }
+      const offset = pointerOffset(addr, rec.base);
+      const tt = g_bitmap_test(rec.targetBits, rec.size, offset) !== 0;
+      const functionStart = g_bitmap_test(rec.functionBits, rec.size, offset) !== 0;
+      return { tt, functionStart };
     }
     function moduleOffset(addr, mod) {
       if (!mod)
@@ -146,10 +227,14 @@ var require_agent = __commonJS({
       });
     }
     function recordTraceEvent(kind, loc, target, tid, source) {
+      const srcClass = classifyAddress(loc);
+      const dstClass = classifyAddress(target);
+      if (!srcClass.tt && !dstClass.tt)
+        return;
       const srcMod = findModuleSafe(loc);
       const dstMod = findModuleSafe(target);
       const isCall = kind === "call";
-      const dstIsExternal = isCall && isTarget(srcMod) && dstMod !== null && !isTarget(dstMod);
+      const dstIsExternal = isCall && srcClass.tt && dstMod !== null && !dstClass.tt;
       const out = {
         k: isCall ? 0 : 1,
         src: ph(loc),
@@ -161,9 +246,11 @@ var require_agent = __commonJS({
         dst_module: dstMod ? dstMod.name : "unknown",
         dst_offset: moduleOffset(target, dstMod),
         dst_is_external: dstIsExternal,
+        src_tt: srcClass.tt,
+        dst_tt: dstClass.tt,
         source
       };
-      if (isCall || isTarget(srcMod) || isTarget(dstMod)) {
+      if (isCall || srcClass.tt || dstClass.tt) {
         out.src_symbol = symbolName(loc);
         out.dst_symbol = symbolName(target);
       }
@@ -173,117 +260,9 @@ var require_agent = __commonJS({
       }
     }
     function hookTargetExports(mod) {
-      if (!isTarget(mod))
-        return;
-      let hooked = 0;
-      let failed = 0;
-      let exports2 = [];
-      try {
-        exports2 = mod.enumerateExports();
-      } catch (_) {
-        return;
-      }
-      for (const ex of exports2) {
-        if (ex.type !== "function")
-          continue;
-        const key = normalizedTargetName(mod.name) + "!" + ex.name + "@" + ph(ex.address);
-        if (g_hooked_target_exports.has(key))
-          continue;
-        g_hooked_target_exports.add(key);
-        try {
-          Interceptor.attach(ex.address, {
-            onEnter(_) {
-              const tid = Process.getCurrentThreadId();
-              const ra = this.returnAddress;
-              const tailTarget = detectVtableTailJump(ex.address, this.context);
-              this._fd_tid = tid;
-              this._fd_ra = ra;
-              this._fd_tail_target = tailTarget;
-              this._fd_tail_site = tailTarget ? tailJumpSite(ex.address) : null;
-              recordTraceEvent("call", ra, ex.address, tid, "target_export");
-              if (tailTarget) {
-                recordTraceEvent("call", tailJumpSite(ex.address), tailTarget, tid, "target_export_tail_jump");
-              }
-            },
-            onLeave(_) {
-              const tid = this._fd_tid || Process.getCurrentThreadId();
-              const ra = this._fd_ra;
-              const tailTarget = this._fd_tail_target;
-              const tailSite = this._fd_tail_site;
-              if (tailTarget && tailSite) {
-                recordTraceEvent("ret", tailTarget, tailSite, tid, "target_export_tail_jump");
-              }
-              if (ra)
-                recordTraceEvent("ret", ex.address, ra, tid, "target_export");
-            }
-          });
-          hooked++;
-        } catch (_) {
-          failed++;
-        }
-      }
-      if (hooked > 0 || failed > 0) {
-        send({
-          type: "status",
-          text: "target_export_hooks module=" + mod.name + " hooked=" + hooked + " failed=" + failed
-        });
-      }
-    }
-    function tailJumpSite(entry) {
-      return entry.add(6);
-    }
-    function detectVtableTailJump(entry, ctx) {
-      if (Process.arch !== "x64")
-        return null;
-      let disp = -1;
-      try {
-        if (entry.readU8() !== 72)
-          return null;
-        if (entry.add(1).readU8() !== 139)
-          return null;
-        if (entry.add(2).readU8() !== 9)
-          return null;
-        if (entry.add(3).readU8() !== 72)
-          return null;
-        if (entry.add(4).readU8() !== 139)
-          return null;
-        if (entry.add(5).readU8() !== 1)
-          return null;
-        if (entry.add(6).readU8() !== 72)
-          return null;
-        if (entry.add(7).readU8() !== 255)
-          return null;
-        if (entry.add(8).readU8() !== 96)
-          return null;
-        disp = entry.add(9).readU8();
-      } catch (_) {
-        return null;
-      }
-      try {
-        const x64 = ctx;
-        const thisPtr = x64.rcx;
-        if (!thisPtr || thisPtr.isNull())
-          return null;
-        const implThis = thisPtr.readPointer();
-        if (implThis.isNull())
-          return null;
-        const vtable = implThis.readPointer();
-        if (vtable.isNull())
-          return null;
-        const target = vtable.add(disp).readPointer();
-        if (target.isNull())
-          return null;
-        if (!findModuleSafe(target))
-          return null;
-        return target;
-      } catch (_) {
-        return null;
-      }
+      void mod;
     }
     function hookLoadedTargetExports() {
-      for (const mod of Process.enumerateModules()) {
-        hookTargetExports(mod);
-      }
     }
     var THREAD_SUSPEND_RESUME = 2;
     function getThreadApi() {
@@ -367,6 +346,7 @@ var require_agent = __commonJS({
       g_module_observer = Process.attachModuleObserver({
         onAdded(mod) {
           recordLoad(mod.name, mod.base, mod.size);
+          refreshTargetModuleRecord(mod);
           if (g_targets.size > 0)
             hookTargetExports(mod);
           send({
@@ -376,6 +356,7 @@ var require_agent = __commonJS({
         },
         onRemoved(mod) {
           recordUnload(mod.name, mod.base, mod.size);
+          removeTargetModuleRecord(mod);
           send({
             type: "status",
             text: "module_observer:remove " + mod.name + " base=" + ph(mod.base)
@@ -607,6 +588,7 @@ var require_agent = __commonJS({
         const mainMod = Process.enumerateModules()[0];
         if (mainMod)
           g_targets.add(normalizedTargetName(mainMod.name));
+        rebuildTargetModuleRecords();
         hookLoadedTargetExports();
         send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
       },
@@ -620,6 +602,7 @@ var require_agent = __commonJS({
           g_targets.add(name);
           g_function_starts_by_module.set(name, (cfg.function_starts || []).map((v) => String(v)));
         }
+        rebuildTargetModuleRecords();
         hookLoadedTargetExports();
         let starts = 0;
         for (const offsets of g_function_starts_by_module.values()) {

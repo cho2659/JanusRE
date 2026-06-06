@@ -31,6 +31,8 @@ interface RawEvent {
   dst_offset?: string;
   dst_symbol?: string;
   dst_is_external?: boolean;
+  src_tt?: boolean;
+  dst_tt?: boolean;
   source?: string;
 }
 
@@ -138,7 +140,6 @@ let g_sent_handle_events = 0;
 const g_handle_gen_by_key: Map<string, number> = new Map();
 let g_next_handle_gen = 1;
 const g_symbol_name_by_va: Map<string, string> = new Map();
-const g_hooked_target_exports: Set<string> = new Set();
 
 type LastExternalCall = {
   caller_va: string;
@@ -153,6 +154,18 @@ const g_export_symbols_by_module: Map<string, Array<{ name: string; address: Nat
 // 타겟 모듈 집합 (소문자). rpc.setTargets()로 갱신.
 let g_targets: Set<string> = new Set();
 const g_function_starts_by_module: Map<string, string[]> = new Map();
+
+type TargetModuleRecord = {
+  name: string;
+  base: NativePointer;
+  size: number;
+  targetBits: NativePointer;
+  functionBits: NativePointer;
+};
+
+const g_target_module_records: TargetModuleRecord[] = [];
+let g_classifier_module: CModule | null = null;
+let g_bitmap_test: ((bits: NativePointer, bitCount: number, offset: number) => number) | null = null;
 
 const SESSION_ID  = generateUUID();
 const MAX_BT      = 24; // 콜스택 역추적 최대 깊이
@@ -213,6 +226,103 @@ function normalizedTargetName(name: string): string {
 function isTarget(mod: { name: string } | null): boolean {
   if (!mod) return false;
   return g_targets.has(normalizedTargetName(mod.name));
+}
+
+function ensureClassifier(): void {
+  if (g_bitmap_test) return;
+  g_classifier_module = new CModule(`
+    int bitmap_test(const unsigned char *bits,
+                    unsigned long long bit_count,
+                    unsigned long long offset) {
+      if (bits == 0 || offset >= bit_count) return 0;
+      return (bits[offset >> 3] >> (offset & 7)) & 1;
+    }
+  `);
+  g_bitmap_test = new NativeFunction(
+    (g_classifier_module as any).bitmap_test,
+    "int",
+    ["pointer", "uint64", "uint64"],
+  ) as unknown as ((bits: NativePointer, bitCount: number, offset: number) => number);
+}
+
+function pointerOffset(addr: NativePointer, base: NativePointer): number {
+  return parseInt(addr.sub(base).toString(16), 16);
+}
+
+function allocBitmap(bitCount: number, fill: boolean, offsets: string[] = []): NativePointer {
+  ensureClassifier();
+  const byteCount = Math.max(1, Math.ceil(Math.max(0, bitCount) / 8));
+  const bytes = new Uint8Array(byteCount);
+  if (fill) {
+    bytes.fill(0xff);
+  } else {
+    for (const offText of offsets) {
+      const offset = parseInt(String(offText), 16);
+      if (!Number.isFinite(offset) || offset < 0 || offset >= bitCount) continue;
+      const byteIndex = offset >> 3;
+      bytes[byteIndex] = (bytes[byteIndex] || 0) | (1 << (offset & 7));
+    }
+  }
+  const mem = Memory.alloc(byteCount);
+  mem.writeByteArray(bytes.buffer);
+  return mem;
+}
+
+function removeTargetModuleRecord(mod: Module): void {
+  for (let i = g_target_module_records.length - 1; i >= 0; i--) {
+    const rec = g_target_module_records[i]!;
+    if (rec.name === normalizedTargetName(mod.name)
+        && rec.base.equals(mod.base)) {
+      g_target_module_records.splice(i, 1);
+    }
+  }
+}
+
+function refreshTargetModuleRecord(mod: Module): void {
+  const name = normalizedTargetName(mod.name);
+  removeTargetModuleRecord(mod);
+  if (!g_targets.has(name)) return;
+  const starts = g_function_starts_by_module.get(name) || [];
+  g_target_module_records.push({
+    name,
+    base: mod.base,
+    size: mod.size,
+    targetBits: allocBitmap(mod.size, true),
+    functionBits: allocBitmap(mod.size, false, starts),
+  });
+}
+
+function rebuildTargetModuleRecords(): void {
+  g_target_module_records.length = 0;
+  for (const mod of Process.enumerateModules()) {
+    refreshTargetModuleRecord(mod);
+  }
+}
+
+function targetRecordForAddress(addr: NativePointer | null): TargetModuleRecord | null {
+  if (!addr) return null;
+  for (const rec of g_target_module_records) {
+    if (addr.compare(rec.base) >= 0
+        && addr.compare(rec.base.add(rec.size)) < 0) {
+      return rec;
+    }
+  }
+  return null;
+}
+
+function classifyAddress(addr: NativePointer | null): {
+  tt: boolean;
+  functionStart: boolean;
+} {
+  ensureClassifier();
+  const rec = targetRecordForAddress(addr);
+  if (!addr || !rec || !g_bitmap_test) {
+    return { tt: false, functionStart: false };
+  }
+  const offset = pointerOffset(addr, rec.base);
+  const tt = g_bitmap_test(rec.targetBits, rec.size, offset) !== 0;
+  const functionStart = g_bitmap_test(rec.functionBits, rec.size, offset) !== 0;
+  return { tt, functionStart };
 }
 
 function moduleOffset(addr: NativePointer, mod: Module | null): string {
@@ -312,13 +422,17 @@ function recordTraceEvent(
   tid: number,
   source: string,
 ): void {
+  const srcClass = classifyAddress(loc);
+  const dstClass = classifyAddress(target);
+  if (!srcClass.tt && !dstClass.tt) return;
+
   const srcMod = findModuleSafe(loc);
   const dstMod = findModuleSafe(target);
   const isCall = kind === "call";
   const dstIsExternal = isCall
-    && isTarget(srcMod)
+    && srcClass.tt
     && dstMod !== null
-    && !isTarget(dstMod);
+    && !dstClass.tt;
 
   const out: RawEvent = {
     k: isCall ? 0 : 1,
@@ -329,9 +443,11 @@ function recordTraceEvent(
     dst_module: dstMod ? dstMod.name : "unknown",
     dst_offset: moduleOffset(target, dstMod),
     dst_is_external: dstIsExternal,
+    src_tt: srcClass.tt,
+    dst_tt: dstClass.tt,
     source,
   };
-  if (isCall || isTarget(srcMod) || isTarget(dstMod)) {
+  if (isCall || srcClass.tt || dstClass.tt) {
     out.src_symbol = symbolName(loc);
     out.dst_symbol = symbolName(target);
   }
@@ -342,61 +458,7 @@ function recordTraceEvent(
 }
 
 function hookTargetExports(mod: Module): void {
-  if (!isTarget(mod)) return;
-
-  let hooked = 0;
-  let failed = 0;
-  let exports: ModuleExportDetails[] = [];
-  try {
-    exports = mod.enumerateExports();
-  } catch (_) {
-    return;
-  }
-
-  for (const ex of exports) {
-    if (ex.type !== "function") continue;
-    const key = normalizedTargetName(mod.name) + "!" + ex.name + "@" + ph(ex.address);
-    if (g_hooked_target_exports.has(key)) continue;
-    g_hooked_target_exports.add(key);
-    try {
-      Interceptor.attach(ex.address, {
-        onEnter(_) {
-          const tid = Process.getCurrentThreadId();
-          const ra = (this as any).returnAddress as NativePointer;
-          const tailTarget = detectVtableTailJump(ex.address, (this as any).context);
-          (this as any)._fd_tid = tid;
-          (this as any)._fd_ra = ra;
-          (this as any)._fd_tail_target = tailTarget;
-          (this as any)._fd_tail_site = tailTarget ? tailJumpSite(ex.address) : null;
-          recordTraceEvent("call", ra, ex.address, tid, "target_export");
-          if (tailTarget) {
-            recordTraceEvent("call", tailJumpSite(ex.address), tailTarget, tid, "target_export_tail_jump");
-          }
-        },
-        onLeave(_) {
-          const tid = (this as any)._fd_tid || Process.getCurrentThreadId();
-          const ra = (this as any)._fd_ra as NativePointer | undefined;
-          const tailTarget = (this as any)._fd_tail_target as NativePointer | null | undefined;
-          const tailSite = (this as any)._fd_tail_site as NativePointer | null | undefined;
-          if (tailTarget && tailSite) {
-            recordTraceEvent("ret", tailTarget, tailSite, tid, "target_export_tail_jump");
-          }
-          if (ra) recordTraceEvent("ret", ex.address, ra, tid, "target_export");
-        },
-      });
-      hooked++;
-    } catch (_) {
-      failed++;
-    }
-  }
-
-  if (hooked > 0 || failed > 0) {
-    send({
-      type: "status",
-      text: "target_export_hooks module=" + mod.name
-        + " hooked=" + hooked + " failed=" + failed,
-    });
-  }
+  void mod;
 }
 
 function tailJumpSite(entry: NativePointer): NativePointer {
@@ -440,9 +502,7 @@ function detectVtableTailJump(entry: NativePointer, ctx: CpuContext): NativePoin
 }
 
 function hookLoadedTargetExports(): void {
-  for (const mod of Process.enumerateModules()) {
-    hookTargetExports(mod);
-  }
+  // Target export Interceptor recording is intentionally disabled.
 }
 
 /**
@@ -576,6 +636,7 @@ function hookModules(): void {
   g_module_observer = Process.attachModuleObserver({
     onAdded(mod) {
       recordLoad(mod.name, mod.base, mod.size);
+      refreshTargetModuleRecord(mod);
       if (g_targets.size > 0) hookTargetExports(mod);
       send({
         type: "status",
@@ -584,6 +645,7 @@ function hookModules(): void {
     },
     onRemoved(mod) {
       recordUnload(mod.name, mod.base, mod.size);
+      removeTargetModuleRecord(mod);
       send({
         type: "status",
         text: "module_observer:remove " + mod.name + " base=" + ph(mod.base),
@@ -849,6 +911,7 @@ rpc.exports = {
     // 메인 EXE는 항상 포함
     const mainMod = Process.enumerateModules()[0];
     if (mainMod) g_targets.add(normalizedTargetName(mainMod.name));
+    rebuildTargetModuleRecords();
     hookLoadedTargetExports();
     send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
   },
@@ -863,6 +926,7 @@ rpc.exports = {
       g_function_starts_by_module.set(
         name, (cfg.function_starts || []).map(v => String(v)));
     }
+    rebuildTargetModuleRecords();
     hookLoadedTargetExports();
     let starts = 0;
     for (const offsets of g_function_starts_by_module.values()) {
