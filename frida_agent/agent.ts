@@ -127,6 +127,8 @@ let g_flushed = false;
 let g_started = false;
 let g_status_timer: ReturnType<typeof setInterval> | null = null;
 let g_thread_api: ThreadApi | null = null;
+let g_thread_observer: any = null;
+let g_module_observer: any = null;
 let g_sent_events = 0;
 let g_sent_mod_events = 0;
 let g_sent_sync_events = 0;
@@ -567,38 +569,27 @@ function recordUnload(name: string, base: NativePointer, size: number) {
 }
 
 function hookModules(): void {
-  for (const mod of Process.enumerateModules()) recordLoad(mod.name, mod.base, mod.size);
-
-  const ntdll = Process.getModuleByName("ntdll.dll");
-
-  const ldrLoad = ntdll.findExportByName("LdrLoadDll");
-  if (ldrLoad) {
-    Interceptor.attach(ldrLoad, {
-      onEnter(_) {
-        (this as any)._before = new Set(
-          Process.enumerateModules().map(m => m.name.toLowerCase()));
-      },
-      onLeave(rv) {
-        if (rv.toInt32() !== 0) return;
-        for (const mod of Process.enumerateModules()) {
-          if (!(this as any)._before.has(mod.name.toLowerCase())) {
-            recordLoad(mod.name, mod.base, mod.size);
-            hookTargetExports(mod);
-          }
-        }
-      },
-    });
+  if (g_module_observer) return;
+  if (typeof Process.attachModuleObserver !== "function") {
+    throw new Error("Process.attachModuleObserver is not available");
   }
-
-  const ldrUnload = ntdll.findExportByName("LdrUnloadDll");
-  if (ldrUnload) {
-    Interceptor.attach(ldrUnload, {
-      onEnter(args) {
-        const mod = Process.findModuleByAddress(args[0]!);
-        if (mod) recordUnload(mod.name, mod.base, mod.size);
-      },
-    });
-  }
+  g_module_observer = Process.attachModuleObserver({
+    onAdded(mod) {
+      recordLoad(mod.name, mod.base, mod.size);
+      if (g_targets.size > 0) hookTargetExports(mod);
+      send({
+        type: "status",
+        text: "module_observer:add " + mod.name + " base=" + ph(mod.base),
+      });
+    },
+    onRemoved(mod) {
+      recordUnload(mod.name, mod.base, mod.size);
+      send({
+        type: "status",
+        text: "module_observer:remove " + mod.name + " base=" + ph(mod.base),
+      });
+    },
+  });
 }
 
 // ══════════════════════════════════════════════════════════
@@ -706,101 +697,48 @@ function beginTrace(initialTids: number[] = []): void {
 }
 
 // ══════════════════════════════════════════════════════════
-// 스레드 생성 (ntdll)
+// 스레드 관찰
 // ══════════════════════════════════════════════════════════
 
 function hookThreadCreation(): void {
-  const ntdll = Process.getModuleByName("ntdll.dll");
-
-  const onNewThread = (
-    apiName: string, status: string, handlePtr: NativePointer,
-    startVa: string, callerVa: string, parentTid: number,
-  ) => {
-    if (handlePtr.isNull()) {
-      send({ type: "status", text: "thread_create_no_handle_ptr parent_tid=" + parentTid });
-      scheduleFailureScan("thread_create_no_handle_ptr");
-      return;
-    }
-    const handle = handlePtr.readPointer();
-    if (handle.isNull()) {
-      send({ type: "status", text: "thread_create_null_handle parent_tid=" + parentTid });
-      scheduleFailureScan("thread_create_null_handle");
-      return;
-    }
-
-    const api = getThreadApi();
-    const tid = api && api.getThreadId ? api.getThreadId(handle) : 0;
-    const gen = recordHandleCreate(apiName, handle, status, "thread");
-    if (!tid) {
-      send({ type: "status", text: "thread_create_no_tid parent_tid=" + parentTid + " start=" + startVa });
-      scheduleFailureScan("thread_create_no_tid");
-      return;
-    }
-
-    const creator = pointerDetails(callerVa);
-    const start = pointerDetails(startVa);
-    g_spawn_events.push({
-      seq: nextSeq(), api: apiName,
-      parent_tid: parentTid, child_tid: tid,
-      thread_handle: ph(handle), handle_gen: gen,
-      creator_va: callerVa, start_va: startVa,
-      creator_module: creator.module,
-      creator_offset: creator.offset,
-      creator_symbol: creator.symbol,
-      start_module: start.module,
-      start_offset: start.offset,
-      start_symbol: start.symbol,
-      status,
-    });
-    send({
-      type: "status",
-      text: "thread_create tid=" + tid
-        + " parent_tid=" + parentTid
-        + " start=" + startVa
-        + " caller=" + callerVa
-        + " caller_mod=" + creator.module + "!" + creator.offset
-        + " start_mod=" + start.module + "!" + start.offset,
-    });
-    if (!attachStalker(tid, "thread_create")) {
-      scheduleFailureScan("thread_create_attach_failed");
-    }
-  };
-
-  const ntCreateThreadEx = ntdll.findExportByName("NtCreateThreadEx");
-  if (ntCreateThreadEx) {
-    Interceptor.attach(ntCreateThreadEx, {
-      onEnter(args) {
-        (this as any)._hp  = args[0]!;
-        (this as any)._sv  = ph(args[4]!);
-        (this as any)._cv  = findThreadCreator(
-          this.context, (this as any).returnAddress as NativePointer);
-        (this as any)._pt  = Process.getCurrentThreadId();
-      },
-      onLeave(rv) {
-        if (rv.toInt32() === 0)
-          onNewThread("NtCreateThreadEx", ntStatus(rv), (this as any)._hp, (this as any)._sv,
-                      (this as any)._cv, (this as any)._pt);
-      },
-    });
+  if (g_thread_observer) return;
+  if (typeof Process.attachThreadObserver !== "function") {
+    throw new Error("Process.attachThreadObserver is not available");
   }
-
-  const ntCreateThread = ntdll.findExportByName("NtCreateThread");
-  if (ntCreateThread) {
-    Interceptor.attach(ntCreateThread, {
-      onEnter(args) {
-        (this as any)._hp = args[0]!;
-        (this as any)._sv = "unknown";
-        (this as any)._cv = findThreadCreator(
-          this.context, (this as any).returnAddress as NativePointer);
-        (this as any)._pt = Process.getCurrentThreadId();
-      },
-      onLeave(rv) {
-        if (rv.toInt32() === 0)
-          onNewThread("NtCreateThread", ntStatus(rv), (this as any)._hp, (this as any)._sv,
-                      (this as any)._cv, (this as any)._pt);
-      },
-    });
-  }
+  g_thread_observer = Process.attachThreadObserver({
+    onAdded(thread) {
+      const tid = thread.id;
+      send({ type: "status", text: "thread_observer:add tid=" + tid });
+      if (!g_started) return;
+      g_spawn_events.push({
+        seq: nextSeq(), api: "thread_observer",
+        parent_tid: 0, child_tid: tid,
+        thread_handle: "unknown",
+        creator_va: "unknown", start_va: "unknown",
+        creator_module: "unknown", creator_offset: "0x0",
+        creator_symbol: "",
+        start_module: "unknown", start_offset: "0x0",
+        start_symbol: "",
+        status: "observed",
+      });
+      if (!attachStalker(tid, "thread_observer")) {
+        scheduleFailureScan("thread_observer_attach_failed");
+      }
+    },
+    onRemoved(thread) {
+      const tid = thread.id;
+      g_stalked.delete(tid);
+      g_attach_failed.delete(tid);
+      send({ type: "status", text: "thread_observer:remove tid=" + tid });
+    },
+    onRenamed(thread, previousName) {
+      send({
+        type: "status",
+        text: "thread_observer:rename tid=" + thread.id
+          + " previous=" + (previousName || ""),
+      });
+    },
+  });
 }
 
 // ══════════════════════════════════════════════════════════

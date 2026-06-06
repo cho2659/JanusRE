@@ -1,5 +1,5 @@
 📦
-26281 /agent.js
+21731 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -32,13 +32,13 @@ var require_agent = __commonJS({
     var g_started = false;
     var g_status_timer = null;
     var g_thread_api = null;
+    var g_thread_observer = null;
+    var g_module_observer = null;
     var g_sent_events = 0;
     var g_sent_mod_events = 0;
     var g_sent_sync_events = 0;
     var g_sent_spawn_events = 0;
     var g_sent_handle_events = 0;
-    var g_handle_gen_by_key = /* @__PURE__ */ new Map();
-    var g_next_handle_gen = 1;
     var g_symbol_name_by_va = /* @__PURE__ */ new Map();
     var g_hooked_target_exports = /* @__PURE__ */ new Set();
     var g_last_external_call_by_tid = /* @__PURE__ */ new Map();
@@ -46,9 +46,7 @@ var require_agent = __commonJS({
     var g_targets = /* @__PURE__ */ new Set();
     var g_function_starts_by_module = /* @__PURE__ */ new Map();
     var SESSION_ID = generateUUID();
-    var MAX_BT = 24;
     var FAILURE_SCAN_DELAY_MS = 50;
-    var LAST_EXTERNAL_CALL_TTL_MS = 1500;
     function generateUUID() {
       return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
         const r = Math.random() * 16 | 0;
@@ -60,31 +58,6 @@ var require_agent = __commonJS({
     }
     function nextSeq() {
       return g_seq++;
-    }
-    function ntStatus(rv) {
-      return ph(rv);
-    }
-    function handleKey(handle) {
-      if (typeof handle === "string")
-        return handle.toLowerCase();
-      return ph(handle).toLowerCase();
-    }
-    function recordHandleCreate(api, handle, status, kind) {
-      const key = handleKey(handle);
-      const gen = g_next_handle_gen++;
-      g_handle_gen_by_key.set(key, gen);
-      const ev = {
-        seq: nextSeq(),
-        tid: Process.getCurrentThreadId(),
-        action: "create",
-        api,
-        handle: ph(handle),
-        handle_gen: gen,
-        status,
-        kind
-      };
-      g_handle_events.push(ev);
-      return gen;
     }
     function normalizedTargetName(name) {
       const raw = (name || "").toLowerCase().replace(/\\/g, "/");
@@ -160,22 +133,6 @@ var require_agent = __commonJS({
         return Process.findModuleByAddress(addr);
       } catch (_) {
         return null;
-      }
-    }
-    function pointerDetails(va) {
-      if (!va || va === "unknown") {
-        return { module: "unknown", offset: "0x0", symbol: "" };
-      }
-      try {
-        const p = ptr(va);
-        const mod = findModuleSafe(p);
-        return {
-          module: mod ? mod.name : "unknown",
-          offset: moduleOffset(p, mod),
-          symbol: symbolName(p)
-        };
-      } catch (_) {
-        return { module: "unknown", offset: "0x0", symbol: "" };
       }
     }
     function noteExternalBoundaryCall(tid, loc, target, dstMod) {
@@ -328,41 +285,6 @@ var require_agent = __commonJS({
         hookTargetExports(mod);
       }
     }
-    function findTargetCaller(ctx, immediateReturn) {
-      const immediateMod = findModuleSafe(immediateReturn || null);
-      if (immediateMod && g_targets.has(immediateMod.name.toLowerCase())) {
-        return ph(immediateReturn);
-      }
-      const arch = Process.arch;
-      const x64 = ctx;
-      const ia32 = ctx;
-      let rsp = arch === "ia32" ? ia32.esp : x64.rsp;
-      for (let i = 0; i < MAX_BT; i++) {
-        let ra;
-        try {
-          ra = rsp.readPointer();
-        } catch (_) {
-          break;
-        }
-        if (ra.isNull())
-          break;
-        const mod = findModuleSafe(ra);
-        if (mod && g_targets.has(mod.name.toLowerCase()))
-          return ph(ra);
-        rsp = rsp.add(Process.pointerSize);
-      }
-      return "unknown";
-    }
-    function findThreadCreator(ctx, immediateReturn) {
-      const tid = Process.getCurrentThreadId();
-      const last = g_last_external_call_by_tid.get(tid);
-      const lastMod = last ? last.target_module.toLowerCase() : "";
-      const looksLikeThreadApi = lastMod === "ntdll.dll" || lastMod === "kernel32.dll" || lastMod === "kernelbase.dll";
-      if (last && looksLikeThreadApi && Date.now() - last.at_ms <= LAST_EXTERNAL_CALL_TTL_MS) {
-        return last.caller_va;
-      }
-      return findTargetCaller(ctx, immediateReturn);
-    }
     var THREAD_SUSPEND_RESUME = 2;
     function getThreadApi() {
       if (g_thread_api)
@@ -437,37 +359,29 @@ var require_agent = __commonJS({
       });
     }
     function hookModules() {
-      for (const mod of Process.enumerateModules())
-        recordLoad(mod.name, mod.base, mod.size);
-      const ntdll = Process.getModuleByName("ntdll.dll");
-      const ldrLoad = ntdll.findExportByName("LdrLoadDll");
-      if (ldrLoad) {
-        Interceptor.attach(ldrLoad, {
-          onEnter(_) {
-            this._before = new Set(Process.enumerateModules().map((m) => m.name.toLowerCase()));
-          },
-          onLeave(rv) {
-            if (rv.toInt32() !== 0)
-              return;
-            for (const mod of Process.enumerateModules()) {
-              if (!this._before.has(mod.name.toLowerCase())) {
-                recordLoad(mod.name, mod.base, mod.size);
-                hookTargetExports(mod);
-              }
-            }
-          }
-        });
+      if (g_module_observer)
+        return;
+      if (typeof Process.attachModuleObserver !== "function") {
+        throw new Error("Process.attachModuleObserver is not available");
       }
-      const ldrUnload = ntdll.findExportByName("LdrUnloadDll");
-      if (ldrUnload) {
-        Interceptor.attach(ldrUnload, {
-          onEnter(args) {
-            const mod = Process.findModuleByAddress(args[0]);
-            if (mod)
-              recordUnload(mod.name, mod.base, mod.size);
-          }
-        });
-      }
+      g_module_observer = Process.attachModuleObserver({
+        onAdded(mod) {
+          recordLoad(mod.name, mod.base, mod.size);
+          if (g_targets.size > 0)
+            hookTargetExports(mod);
+          send({
+            type: "status",
+            text: "module_observer:add " + mod.name + " base=" + ph(mod.base)
+          });
+        },
+        onRemoved(mod) {
+          recordUnload(mod.name, mod.base, mod.size);
+          send({
+            type: "status",
+            text: "module_observer:remove " + mod.name + " base=" + ph(mod.base)
+          });
+        }
+      });
     }
     function attachStalker(tid, reason = "unknown") {
       if (g_stalked.has(tid)) {
@@ -555,84 +469,50 @@ var require_agent = __commonJS({
       }, 1e3);
     }
     function hookThreadCreation() {
-      const ntdll = Process.getModuleByName("ntdll.dll");
-      const onNewThread = (apiName, status, handlePtr, startVa, callerVa, parentTid) => {
-        if (handlePtr.isNull()) {
-          send({ type: "status", text: "thread_create_no_handle_ptr parent_tid=" + parentTid });
-          scheduleFailureScan("thread_create_no_handle_ptr");
-          return;
-        }
-        const handle = handlePtr.readPointer();
-        if (handle.isNull()) {
-          send({ type: "status", text: "thread_create_null_handle parent_tid=" + parentTid });
-          scheduleFailureScan("thread_create_null_handle");
-          return;
-        }
-        const api = getThreadApi();
-        const tid = api && api.getThreadId ? api.getThreadId(handle) : 0;
-        const gen = recordHandleCreate(apiName, handle, status, "thread");
-        if (!tid) {
-          send({ type: "status", text: "thread_create_no_tid parent_tid=" + parentTid + " start=" + startVa });
-          scheduleFailureScan("thread_create_no_tid");
-          return;
-        }
-        const creator = pointerDetails(callerVa);
-        const start = pointerDetails(startVa);
-        g_spawn_events.push({
-          seq: nextSeq(),
-          api: apiName,
-          parent_tid: parentTid,
-          child_tid: tid,
-          thread_handle: ph(handle),
-          handle_gen: gen,
-          creator_va: callerVa,
-          start_va: startVa,
-          creator_module: creator.module,
-          creator_offset: creator.offset,
-          creator_symbol: creator.symbol,
-          start_module: start.module,
-          start_offset: start.offset,
-          start_symbol: start.symbol,
-          status
-        });
-        send({
-          type: "status",
-          text: "thread_create tid=" + tid + " parent_tid=" + parentTid + " start=" + startVa + " caller=" + callerVa + " caller_mod=" + creator.module + "!" + creator.offset + " start_mod=" + start.module + "!" + start.offset
-        });
-        if (!attachStalker(tid, "thread_create")) {
-          scheduleFailureScan("thread_create_attach_failed");
-        }
-      };
-      const ntCreateThreadEx = ntdll.findExportByName("NtCreateThreadEx");
-      if (ntCreateThreadEx) {
-        Interceptor.attach(ntCreateThreadEx, {
-          onEnter(args) {
-            this._hp = args[0];
-            this._sv = ph(args[4]);
-            this._cv = findThreadCreator(this.context, this.returnAddress);
-            this._pt = Process.getCurrentThreadId();
-          },
-          onLeave(rv) {
-            if (rv.toInt32() === 0)
-              onNewThread("NtCreateThreadEx", ntStatus(rv), this._hp, this._sv, this._cv, this._pt);
-          }
-        });
+      if (g_thread_observer)
+        return;
+      if (typeof Process.attachThreadObserver !== "function") {
+        throw new Error("Process.attachThreadObserver is not available");
       }
-      const ntCreateThread = ntdll.findExportByName("NtCreateThread");
-      if (ntCreateThread) {
-        Interceptor.attach(ntCreateThread, {
-          onEnter(args) {
-            this._hp = args[0];
-            this._sv = "unknown";
-            this._cv = findThreadCreator(this.context, this.returnAddress);
-            this._pt = Process.getCurrentThreadId();
-          },
-          onLeave(rv) {
-            if (rv.toInt32() === 0)
-              onNewThread("NtCreateThread", ntStatus(rv), this._hp, this._sv, this._cv, this._pt);
+      g_thread_observer = Process.attachThreadObserver({
+        onAdded(thread) {
+          const tid = thread.id;
+          send({ type: "status", text: "thread_observer:add tid=" + tid });
+          if (!g_started)
+            return;
+          g_spawn_events.push({
+            seq: nextSeq(),
+            api: "thread_observer",
+            parent_tid: 0,
+            child_tid: tid,
+            thread_handle: "unknown",
+            creator_va: "unknown",
+            start_va: "unknown",
+            creator_module: "unknown",
+            creator_offset: "0x0",
+            creator_symbol: "",
+            start_module: "unknown",
+            start_offset: "0x0",
+            start_symbol: "",
+            status: "observed"
+          });
+          if (!attachStalker(tid, "thread_observer")) {
+            scheduleFailureScan("thread_observer_attach_failed");
           }
-        });
-      }
+        },
+        onRemoved(thread) {
+          const tid = thread.id;
+          g_stalked.delete(tid);
+          g_attach_failed.delete(tid);
+          send({ type: "status", text: "thread_observer:remove tid=" + tid });
+        },
+        onRenamed(thread, previousName) {
+          send({
+            type: "status",
+            text: "thread_observer:rename tid=" + thread.id + " previous=" + (previousName || "")
+          });
+        }
+      });
     }
     function hookExit() {
       const ntdll = Process.getModuleByName("ntdll.dll");
