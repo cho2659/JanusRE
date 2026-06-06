@@ -66,7 +66,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMenu, QFileDialog,
     QMessageBox, QStatusBar, QTreeWidget, QTreeWidgetItem,
     QGraphicsScene, QGraphicsView, QGraphicsItem,
-    QGraphicsPathItem, QStackedWidget, QLineEdit,
+    QGraphicsPathItem, QStackedWidget, QLineEdit, QSizePolicy,
 )
 
 AGENT_JS_PATH      = Path(__file__).parent / "frida_agent" / "agent.js"
@@ -1195,6 +1195,9 @@ class NodeItem(QGraphicsItem):
             painter.drawText(x, footer_y - 2, by_lbl)
 
     def mouseDoubleClickEvent(self, event):
+        scene = self.scene()
+        if scene and hasattr(scene, "node_selected"):
+            scene.node_selected.emit("__activate__:{}".format(self._node.node_id))
         event.accept()
 
     def mousePressEvent(self, event):
@@ -1407,10 +1410,28 @@ class GraphView(QGraphicsView):
         self._pan_h = 0
         self._pan_v = 0
 
+    def _fit_zoom(self) -> float:
+        br = self.scene().itemsBoundingRect()
+        vp = self.viewport().rect()
+        if br.isEmpty() or vp.isEmpty():
+            return 1.0
+        margin = 40.0
+        w = max(br.width() + margin, 1.0)
+        h = max(br.height() + margin, 1.0)
+        return max(min(vp.width() / w, vp.height() / h), 0.01)
+
+    def _min_zoom(self) -> float:
+        return min(max(self._fit_zoom() / 1.5, 0.01), 8.0)
+
+    def _set_zoom(self, zoom: float):
+        zoom = max(self._min_zoom(), min(zoom, 8.0))
+        self.resetTransform()
+        self.scale(zoom, zoom)
+        self._zoom = zoom
+
     def wheelEvent(self, event: QWheelEvent):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self._zoom = max(0.1, min(self._zoom * factor, 8.0))
-        self.setTransform(self.transform().scale(factor, factor))
+        self._set_zoom(self._zoom * factor)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -1445,14 +1466,13 @@ class GraphView(QGraphicsView):
         if not br.isEmpty():
             self.fitInView(br.adjusted(-20, -20, 20, 20),
                            Qt.AspectRatioMode.KeepAspectRatio)
+            self._zoom = self.transform().m11()
 
     def focus_on(self, node_id: str, zoom: bool = False):
         item = self.scene().focus_node(node_id)
         if item:
             if zoom:
-                self.resetTransform()
-                self._zoom = 1.6
-                self.scale(self._zoom, self._zoom)
+                self._set_zoom(1.6)
             self.centerOn(item)
 
     def reset_zoom(self):
@@ -1476,12 +1496,14 @@ class SearchPanel(QWidget):
 
         self._edit = QLineEdit()
         self._edit.setPlaceholderText("함수명 / 오프셋 검색…")
-        self._edit.setFixedWidth(240)
+        self._edit.setMinimumWidth(80)
+        self._edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._edit.setStyleSheet(
             "background:#FFFFFF;color:#1E293B;"
             "border:1px solid #C0C8D0;border-radius:3px;padding:2px 4px;")
         self._edit.returnPressed.connect(self._submit)
-        ly.addWidget(self._edit)
+        ly.addWidget(self._edit, 1)
 
         for label, slot in [("검색", self._submit),
                              ("◀",   self._prev),
@@ -2195,6 +2217,75 @@ def enumerate_process_threads(pid: int) -> list[int]:
     return tids
 
 
+def _normalized_path(path: str) -> str:
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except Exception:
+        return os.path.normcase(os.path.abspath(path))
+
+
+def process_image_path(pid: int) -> str:
+    if os.name != "nt":
+        return ""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return buf.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def terminate_process_if_image_matches(pid: int, expected_path: str) -> bool:
+    if os.name != "nt" or not pid or not expected_path:
+        return False
+    actual_path = process_image_path(pid)
+    if not actual_path:
+        dbg("target kill skipped: pid={} image query failed".format(pid))
+        return False
+    if _normalized_path(actual_path) != _normalized_path(expected_path):
+        dbg("target kill skipped: pid={} image mismatch actual={}".format(
+            pid, actual_path))
+        return False
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    PROCESS_TERMINATE = 0x0001
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    if not handle:
+        dbg("target kill failed: pid={} open terminate failed".format(pid))
+        return False
+    try:
+        ok = bool(kernel32.TerminateProcess(handle, 1))
+        dbg("target kill {}: pid={}".format("ok" if ok else "failed", pid))
+        return ok
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 # ============================================================
 # TraceSession
 # ============================================================
@@ -2267,6 +2358,7 @@ class FridaWorker(QObject):
     status_changed = Signal(str)
     trace_complete = Signal(TraceSession)
     error_occurred = Signal(str)
+    target_spawned = Signal(int, str)
     finished = Signal()
 
     def __init__(self, target_path: str, project_files: list[str]):
@@ -2315,6 +2407,7 @@ class FridaWorker(QObject):
             dbg("frida.spawn begin")
             self._pid     = frida.spawn(self._target)
             dbg("frida.spawn ok: pid={}".format(self._pid))
+            self.target_spawned.emit(int(self._pid), self._target)
             initial_tids  = enumerate_process_threads(self._pid)
             dbg("frida.attach begin: pid={}".format(self._pid))
             self._session = frida.attach(self._pid)
@@ -3264,6 +3357,8 @@ class MainWindow(QMainWindow):
         self._ghidra_connect_enabled = True
         self._frida_error_dialog_shown = False
         self._project_files: list[str] = []
+        self._target_pid: Optional[int] = None
+        self._target_path = ""
 
         self._setup_menu()
         self._setup_ui()
@@ -3302,11 +3397,13 @@ class MainWindow(QMainWindow):
 
         h_split = QSplitter(Qt.Orientation.Horizontal)
         h_split.setStyleSheet("QSplitter::handle{background:#D1D9E0;width:2px;}")
+        h_split.setChildrenCollapsible(True)
 
         # 왼쪽
         self._left = LeftPanel()
-        self._left.setMinimumWidth(200)
-        self._left.setMaximumWidth(320)
+        self._left.setMinimumWidth(120)
+        self._left.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._left.start_trace_requested.connect(self._start_trace)
         self._left.stop_trace_requested.connect(self._stop_trace)
         h_split.addWidget(self._left)
@@ -3330,23 +3427,34 @@ class MainWindow(QMainWindow):
         right_ly.setContentsMargins(0, 0, 0, 0)
         right_ly.setSpacing(0)
 
+        right_split = QSplitter(Qt.Orientation.Vertical)
+        right_split.setStyleSheet(
+            "QSplitter::handle{background:#D1D9E0;height:2px;}")
+        right_split.setChildrenCollapsible(True)
+
         self._func_panel = FunctionSearchPanel()
         self._func_panel.set_symbol_resolver(self._resolve_ghidra_symbol)
         self._func_panel.function_selected.connect(self._on_function_selected)
-        right_ly.addWidget(self._func_panel, 2)
+        right_split.addWidget(self._func_panel)
 
         self._thread_panel = ThreadListPanel()
-        self._thread_panel.setMinimumHeight(160)
+        self._thread_panel.setMinimumHeight(80)
         self._thread_panel.thread_activated.connect(self._graph.select_thread)
         self._graph.threads_changed.connect(self._thread_panel.set_threads)
         self._graph.current_thread_changed.connect(
             self._thread_panel.set_current_tid)
-        right_ly.addWidget(self._thread_panel, 1)
-        right.setMinimumWidth(320)
-        right.setMaximumWidth(560)
+        right_split.addWidget(self._thread_panel)
+        right_split.setSizes([520, 260])
+        right_ly.addWidget(right_split)
+        right.setMinimumWidth(160)
+        right.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         h_split.addWidget(right)
 
         h_split.setSizes([240, 960, 280])
+        h_split.setStretchFactor(0, 1)
+        h_split.setStretchFactor(1, 4)
+        h_split.setStretchFactor(2, 1)
         ly.addWidget(h_split)
 
         self._sb = QStatusBar()
@@ -3441,6 +3549,8 @@ class MainWindow(QMainWindow):
             self._st("트레이스 실행/종료 처리 중입니다.")
             return
         self._session    = TraceSession()
+        self._target_pid = None
+        self._target_path = str(Path(target_path).resolve())
         self._is_tracing = True
         self._trace_stopping = False
         self._frida_error_dialog_shown = False
@@ -3456,6 +3566,7 @@ class MainWindow(QMainWindow):
         self._frida_worker.status_changed.connect(self._st)
         self._frida_worker.trace_complete.connect(self._on_trace_complete)
         self._frida_worker.error_occurred.connect(self._on_frida_error)
+        self._frida_worker.target_spawned.connect(self._on_target_spawned)
         self._frida_worker.finished.connect(
             lambda w=worker: self._on_frida_finished(w))
         self._frida_worker.finished.connect(self._frida_thread.quit)
@@ -3467,6 +3578,12 @@ class MainWindow(QMainWindow):
         self._frida_thread.started.connect(self._frida_worker.start_trace)
         self._frida_thread.start()
         self._st("트레이스 시작: {}".format(target_path))
+
+    def _on_target_spawned(self, pid: int, target_path: str):
+        self._target_pid = int(pid)
+        self._target_path = str(Path(target_path).resolve())
+        dbg("target recorded: pid={} path={}".format(
+            self._target_pid, self._target_path))
 
     def _stop_trace(self):
         if self._trace_stopping:
@@ -3650,6 +3767,11 @@ class MainWindow(QMainWindow):
             except: pass
         if self._ghidra_worker:
             self._ghidra_worker.stop()
+        if self._target_pid and self._target_path:
+            if terminate_process_if_image_matches(
+                self._target_pid, self._target_path):
+                self._st("대상 프로세스 강제 종료: pid={}".format(
+                    self._target_pid))
         event.accept()
 
 

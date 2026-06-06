@@ -1,0 +1,15 @@
+Process.attachModuleObserver(callbacks)
+
+Process.attachThreadObserver(callbacks)
+
+
+main module
+
+const mainThread = Process.enumerateThreads()[0];
+
+transform(iterator) {
+  //  let instruction = iterator.next();
+  //
+  //  const startAddress = instruction.address;
+  //  const isAppCode = startAddress.compare(appStart) >= 0 &&
+  //      startAddress.compare(appEnd) === -1;
