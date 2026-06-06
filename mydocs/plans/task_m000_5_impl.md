@@ -21,6 +21,7 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
 - Frida JavaScript API 문서: `Process.attachThreadObserver(callbacks)`는 thread 추가/삭제/rename 관찰 API이고, `Process.attachModuleObserver(callbacks)`는 module 추가/삭제 관찰 API다. `onAdded`는 기존 대상도 즉시 호출될 수 있으므로 초기 상태와 이후 변경을 같은 경로로 처리한다.
 - Frida JavaScript API 문서: Stalker `transform(iterator)`는 Stalker가 기본 블록을 재컴파일할 때 동기 호출되며, 기본 블록 단위 계측을 삽입하는 경로다.
 - Frida JavaScript API 문서: CModule은 JavaScript에서 C 코드를 컴파일해 NativePointer 함수로 호출할 수 있는 경로다.
+- Frida JavaScript API 문서: `Process.setExceptionHandler(callback)`은 process-wide native exception handler를 설치하며, callback이 `true`를 반환하지 않으면 대상 프로세스의 예외 처리기로 전달된다.
 - 참조 링크: https://frida.re/docs/javascript-api/
 
 ## 현재 상태 요약
@@ -163,14 +164,20 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
 - 목표 그래프:
   - 실제 흐름: `tt1 -(call 또는 jump)> tf1 -> tf2 -> tf3 -(call 또는 jump)> tt2`
   - 표시 흐름: `tt1 -> tf1 -> tt2`
+- tunnel은 같은 thread 안에서만 성립한다.
+  - `last_external_node`와 outbound/inbound 후보는 `tid`별로 독립 보관한다.
+  - thread가 다르면 모듈/offset 흐름이 이어져 보여도 tunnel로 묶지 않는다.
+  - thread spawn 또는 sync 이벤트로 thread 간 관계를 추정하는 것은 본 task에서 tunnel 조건으로 사용하지 않는다.
 - agent 기록 정책:
   - `tt -> tf` call/jump는 외부 진입 노드 `tf1`로 기록한다.
   - `tf -> tf`는 기록하지 않는다.
   - `tf -> tt` call/jump는 기록한다.
 - Python CallTreeBuilder 정책:
-  - thread별로 `last_external_node`를 둔다.
+  - thread별로 `last_external_node`와 `last_outbound`를 둔다.
   - `tt -> tf` 이벤트를 만나면 external node를 만들고 `last_external_node`에 저장한다.
+  - 동시에 outbound의 `src`는 `tt1` offset, outbound의 `dst`는 `tf1` offset으로 저장한다.
   - 이후 `tf -> tt` 이벤트가 나오면 stack top이 아니라 `last_external_node`에서 `tt2`로 edge를 연결한다.
+  - 이때 inbound의 `src`가 이전 outbound의 `dst`와 같은 외부 모듈/offset이거나, 같은 thread에서 `tf1` 이후 연속 tunnel 상태로 판정될 때만 치환한다.
   - `tf -> tt` 연결 후 `last_external_node`는 제거한다.
   - 같은 thread에서 다른 `tt -> tf`가 먼저 나오면 이전 tunnel은 만료한다.
 - edge kind:
@@ -183,11 +190,53 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
 - ret는 Stalker ret callout 또는 기존 ret event 경로로 확인한다.
 - ret도 classifier를 통과한다.
   - 둘 다 `tf`이면 기록하지 않는다.
-  - `tf -> tt` ret는 external return으로 보고 `last_external_node` 또는 ret stack match를 통해 그래프에 `flow` edge를 만든다.
+  - `tf -> tt` ret는 external return 후보로 본다.
   - `tt -> tf` ret는 target에서 외부로 나가는 흐름이므로 external node 또는 stack unwind에 반영한다.
+- ret 대응은 outbound `src`와 inbound `dst` 대조를 우선한다.
+  - `tt -> tf` outbound ret/call/jump를 저장할 때 outbound `src`는 target caller offset이다.
+  - 이후 같은 thread에서 `tf -> tt` inbound ret가 오면 inbound `dst`가 저장된 outbound `src`와 같은 target module/offset인지 확인한다.
+  - 일치하면 외부 호출에서 원래 target caller로 돌아온 것으로 보고 tunnel/return edge를 닫는다.
+  - 불일치하면 ret stack match를 fallback으로 쓰되, 같은 thread 조건은 유지한다.
 - ret matching은 기존 `_ret_stack_match_index()`를 유지하되, jump로 생성된 node는 call stack push 여부를 분리한다.
   - call node는 stack push.
   - jump node는 tail-call 성격이면 parent를 바꾸되 ret stack push는 하지 않는 정책을 기본으로 한다.
+
+#### exception 기반 tunnel 오탐 억제
+
+- 외부 DLL 실행 중 exception unwind가 발생하면 정상 call/jump inbound가 아니어도 `tf -> tt` 복귀처럼 보일 수 있다.
+- 이 경우 tunnel이 `tt -> tf -> tt`로 잘못 닫히는 오탐이 생길 수 있으므로 `Process.setExceptionHandler(callback)` 사용을 고려한다.
+- v1 정책:
+  - exception handler는 예외를 삼키지 않는다.
+  - callback은 exception details의 `type`, `address`, `context.pc`, `context.sp`, 현재 `tid`, classifier 결과를 기록하고 `false`를 반환해 원래 프로세스 예외 처리기로 전달한다.
+  - 같은 thread의 tunnel state에 `exception_seen` marker를 남긴다.
+  - marker에는 exception 발생 시점의 `pc`가 `tf`인지, `sp` 값, seq 근사값을 포함한다.
+- tunnel 억제 규칙:
+  - `tt -> tf` outbound 이후 같은 thread에서 exception marker가 발생하고, 그 뒤 `tf -> tt` inbound가 들어오면 기본적으로 tunnel 치환하지 않는다.
+  - 단, inbound가 명확한 call/jump event이고 outbound/inbound offset 대조가 직접 일치하는 경우만 예외적으로 tunnel을 허용한다.
+  - ret inbound는 exception marker가 있으면 outbound `src`와 inbound `dst`가 일치해도 exception unwind 가능성을 우선하여 tunnel을 닫지 않고 별도 `exception_return` 후보로 둔다.
+  - exception marker는 같은 thread에서 다음 정상 `tt -> tt` 또는 새 `tt -> tf` outbound를 만나면 만료한다.
+- Python 그래프 정책:
+  - RawEvent 또는 별도 `exception_events`에 exception marker를 저장한다.
+  - CallTreeBuilder는 marker 이후의 inbound를 tunnel이 아닌 `flow` 또는 미표시 후보로 처리한다.
+  - UI에 exception edge를 별도 표시할지는 v2로 미룬다. v1에서는 오탐 억제가 목표다.
+
+### 4-3. sync/handler 계열 Interceptor 정책
+
+- 본 task의 v1 목표는 user-level DLL API hook을 늘리지 않는 것이다.
+- `user32`, `kernel32`, `kernelbase`의 sync/handler/message API를 개별 Interceptor로 확장하는 방식은 유지보수 비용과 미탐 위험을 높인다.
+- 따라서 다음 항목은 version 2 후보로 이월한다.
+  - user32 message handler 계열 세부 추적.
+  - kernel32/kernelbase sync wrapper API별 세부 추적.
+  - GUI message loop 의미론 복원.
+  - handle lifetime을 API별로 완전 복원하는 로직.
+- v1에서 유지 또는 허용하는 낮은 수준의 hook:
+  - process 종료 flush를 위한 `RtlExitUserProcess`, `NtTerminateProcess` 등 최소 종료 hook.
+  - Frida observer API가 대체할 수 없는 경우에 한해 명시 승인된 ntdll 수준 fallback.
+- v1에서 caller 해결 방식:
+  - user-level API hook으로 caller를 찾지 않는다.
+  - Stalker transform의 call/jump/ret 이벤트와 같은-thread tunnel로 `tt` 범위 안 caller를 복원한다.
+  - `tt -> tf` outbound의 `src`를 caller로 저장하고, `tf -> tt` inbound의 `dst` 또는 ret inbound의 `dst`와 대조한다.
+  - 이 경로로 해결되지 않는 user-level sync/handler 의미는 그래프에 억지로 그리지 않고 version 2 분석 대상으로 남긴다.
 
 ## 예상 변경 파일
 
@@ -199,15 +248,19 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
   - trace 시작 시 checked target 목록과 Ghidra function-start offset 수집
   - agent RPC 호출 인자 확장
   - `postprocess()`의 jump 이벤트 처리
-  - `CallTreeBuilder`의 tunnel/jump/ret 그래프 처리
+  - `CallTreeBuilder`의 same-thread tunnel/jump/ret 그래프 처리
+  - outbound `src`와 inbound `dst` 대조 기반 ret 대응
+  - exception marker 기반 tunnel 오탐 억제
 - `frida_agent/agent.ts`
   - target export Interceptor 제거
   - ntdll thread creation Interceptor 제거
   - `attachThreadObserver` 도입
   - `attachModuleObserver` 도입
+  - `Process.setExceptionHandler()` marker 추가
   - CModule classifier 및 bitmap 구축
   - Stalker transform/callout 기반 jump 전이 기록
   - call/ret tf-tf 필터
+  - user-level sync/handler Interceptor 신규 구현 금지
 - `frida_agent/agent.js`
   - `agent.ts` 변경 후 `frida-compile`로 재생성
 - `ghidra_side/frida_bridge.py`
@@ -283,11 +336,16 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
 ### Stage 8 - 그래프 tunnel/return 반영
 
 - CallTreeBuilder가 `jump` 이벤트를 받도록 확장한다.
-- `tt -> tf -> ... -> tt` tunnel 치환을 적용한다.
+- 같은 thread에서만 `tt -> tf -> ... -> tt` tunnel 치환을 적용한다.
+- thread가 다르면 tunnel 후보를 폐기한다.
+- exception marker가 같은 thread의 outbound/inbound 사이에 있으면 tunnel 치환을 억제한다.
 - `tf -> tf` 이벤트는 agent에서 이미 배제되지만, Python에서도 방어적으로 배제한다.
-- ret 이벤트는 classifier 결과와 stack match를 기준으로 external return edge를 만든다.
+- ret 이벤트는 classifier 결과, exception marker, outbound `src`와 inbound `dst` 대조, stack match fallback 순서로 external return edge를 만든다.
 - 검증:
-  - synthetic trace로 `tt1 -> tf1 -> tt2` 그래프 확인
+  - synthetic trace로 같은 thread `tt1 -> tf1 -> tt2` 그래프 확인
+  - synthetic trace로 다른 thread tunnel 미적용 확인
+  - outbound `src`와 inbound `dst`가 일치하는 ret 복귀 확인
+  - exception marker가 outbound/inbound 사이에 있는 경우 tunnel 미적용 확인
   - `tf -> tf` 노드가 생성되지 않는지 확인
   - ret 기반 복귀 edge가 기존 call stack을 과도하게 무너뜨리지 않는지 확인
 
@@ -303,6 +361,7 @@ GitHub Issue: [#5](https://github.com/cho2659/JanusRE/issues/5)
   - 수동 시나리오 3종:
     - checked target 1개만 trace
     - tt -> tf -> tt tunnel
+    - thread가 다른 tt/tf 전이는 tunnel 미적용
     - jump로 target function entry 진입
 
 ## 데이터 형식 초안
@@ -339,6 +398,20 @@ interface RawEvent {
 }
 ```
 
+### ExceptionEvent 초안
+
+```ts
+interface ExceptionEvent {
+  seq: number;
+  tid: number;
+  type: string;
+  address: string;
+  pc: string;
+  sp: string;
+  pc_tt?: boolean;
+}
+```
+
 ## 수용 기준
 
 - target module 체크박스가 각 target 항목 오른쪽에 표시된다.
@@ -351,7 +424,12 @@ interface RawEvent {
 - tf-tf call/ret/jump는 기록되지 않는다.
 - `Stalker.exclude(range)`를 사용하지 않는다.
 - jump 계열은 transform 기반으로 기록된다.
-- `tt1 -> tf1 -> tf2 -> tf3 -> tt2` 흐름은 그래프에서 `tt1 -> tf1 -> tt2`로 표시된다.
+- 같은 thread의 `tt1 -> tf1 -> tf2 -> tf3 -> tt2` 흐름은 그래프에서 `tt1 -> tf1 -> tt2`로 표시된다.
+- 다른 thread의 `tt -> tf -> tt` 유사 흐름은 tunnel로 치환하지 않는다.
+- ret 복귀는 outbound `src`와 inbound `dst` 대조를 우선해 대응한다.
+- exception marker가 같은 thread의 tunnel 후보 사이에 있으면 tunnel 오탐을 억제한다.
+- `Process.setExceptionHandler()`는 exception을 삼키지 않고 원래 프로세스 예외 처리기로 전달한다.
+- user-level sync/handler Interceptor 신규 구현은 v2로 이월한다.
 
 ## 리스크와 대응
 
@@ -360,6 +438,9 @@ interface RawEvent {
 - **CModule 메모리/정렬 리스크**: 1바이트 bitset이 큰 모듈에서 메모리를 더 쓸 수 있다. 우선 정확도를 택하고, 문제가 확인되면 granularity 조정은 별도 승인 후 진행한다.
 - **jump 과기록 리스크**: 조건분기 내부 이동이 그래프를 오염시킬 수 있다. `dst tt && function-start` 조건으로 target 내부 jump 기록을 함수 진입에 한정한다.
 - **ret stack 리스크**: jump와 call의 stack 의미가 다르다. jump node는 기본적으로 stack push하지 않고, call node만 push한다.
+- **cross-thread tunnel 오탐 리스크**: 외부 DLL을 사이에 둔 유사한 흐름이 다른 thread에서 나타날 수 있다. tunnel state를 thread별로 분리하고 thread가 다르면 치환하지 않는다.
+- **exception unwind tunnel 오탐 리스크**: exception으로 외부에서 내부로 복귀하면 정상 inbound처럼 보일 수 있다. `Process.setExceptionHandler()` marker를 기록하고 marker 이후 inbound tunnel을 억제한다.
+- **user-level hook 유지보수 리스크**: user32/kernel32/kernelbase wrapper를 넓게 hook하면 OS 버전/API 변형별 누락 가능성이 커진다. v1에서는 observer, ntdll 최소 hook, Stalker+tunnel만 사용하고 sync/handler 의미론은 v2로 미룬다.
 - **Ghidra 미연결 리스크**: function-start bitmap을 만들 수 없으면 jump 판별이 불완전하다. 본 계획은 trace 시작을 차단하고 사용자에게 Ghidra 연결 필요 상태를 표시한다.
 
 ## 승인 요청 사항
@@ -372,4 +453,8 @@ interface RawEvent {
 - Ghidra function-start 준비가 끝나기 전에는 target exe를 resume하지 않는 정책.
 - RawEvent에 `k=2` jump를 추가하는 데이터 형식 변경.
 - jump node는 기본적으로 call stack push하지 않는 그래프 정책.
+- tunnel은 같은 thread에서만 적용하는 정책.
+- ret 대응에서 outbound `src`와 inbound `dst` 대조를 우선하는 정책.
+- `Process.setExceptionHandler()`를 예외 삼키기 용도가 아니라 tunnel 오탐 억제 marker 용도로 사용하는 정책.
+- user-level sync/handler Interceptor 구현을 version 2로 이월하고, v1에서는 ntdll 최소 hook과 Stalker+tunnel로 caller를 해결하는 정책.
 - 승인 전까지 코드 변경 금지.

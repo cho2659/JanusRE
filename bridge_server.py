@@ -2995,28 +2995,49 @@ class LeftPanel(QWidget):
         ly = QVBoxLayout(self)
         ly.setContentsMargins(4, 4, 4, 4)
 
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.setChildrenCollapsible(True)
+        split.setStyleSheet("QSplitter::handle{background:#D1D9E0;height:2px;}")
+
+        target_box = QWidget()
+        target_ly = QVBoxLayout(target_box)
+        target_ly.setContentsMargins(0, 0, 0, 0)
+        target_ly.setSpacing(4)
         lbl = QLabel("타겟 모듈")
         lbl.setStyleSheet("font-weight:bold;color:#1E293B;")
-        ly.addWidget(lbl)
+        target_ly.addWidget(lbl)
 
-        self._list = QListWidget()
+        self._list = QTreeWidget()
+        self._list.setHeaderLabels(["모듈", "trace"])
+        self._list.setRootIsDecorated(False)
+        self._list.setAlternatingRowColors(True)
         self._list.setStyleSheet(
             "background:#FFFFFF;color:#1E293B;"
-            "border:1px solid #D1D9E0;border-radius:3px;")
+            "border:1px solid #D1D9E0;border-radius:3px;"
+            "QHeaderView::section{background:#EEF2F7;color:#1E293B;"
+            "border:none;padding:3px;font-weight:bold;}")
         self._list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._ctx)
-        ly.addWidget(self._list)
+        target_ly.addWidget(self._list)
+        split.addWidget(target_box)
 
+        loaded_box = QWidget()
+        loaded_ly = QVBoxLayout(loaded_box)
+        loaded_ly.setContentsMargins(0, 0, 0, 0)
+        loaded_ly.setSpacing(4)
         sep = QLabel("로드된 모듈")
         sep.setStyleSheet("font-weight:bold;color:#1E293B;margin-top:6px;")
-        ly.addWidget(sep)
+        loaded_ly.addWidget(sep)
 
         self._loaded = QListWidget()
         self._loaded.setStyleSheet(
             "background:#FAFAFA;color:#6B7280;"
             "border:1px solid #D1D9E0;border-radius:3px;")
-        ly.addWidget(self._loaded)
+        loaded_ly.addWidget(self._loaded)
+        split.addWidget(loaded_box)
+        split.setSizes([320, 240])
+        ly.addWidget(split, 1)
 
         self._stop_btn = QPushButton("■  트레이스 강제 종료")
         self._stop_btn.setEnabled(False)
@@ -3030,10 +3051,23 @@ class LeftPanel(QWidget):
     def set_project_files(self, files: list[str]):
         self._list.clear()
         for f in sorted(files):
-            item = QListWidgetItem(f)
+            item = QTreeWidgetItem([f, ""])
+            item.setData(0, Qt.ItemDataRole.UserRole, f)
+            item.setCheckState(
+                1,
+                Qt.CheckState.Checked
+                if f.lower().endswith(".exe")
+                else Qt.CheckState.Unchecked)
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable)
             if f.lower().endswith(".exe"):
-                item.setForeground(Qt.GlobalColor.cyan)
-            self._list.addItem(item)
+                item.setForeground(0, Qt.GlobalColor.cyan)
+            self._list.addTopLevelItem(item)
+        self._list.resizeColumnToContents(0)
+        self._list.resizeColumnToContents(1)
 
     def update_loaded_modules(self, modules: list[str]):
         existing = {self._loaded.item(i).text()
@@ -3044,12 +3078,21 @@ class LeftPanel(QWidget):
 
     def set_tracing(self, active: bool):
         self._stop_btn.setEnabled(active)
+        self._list.setEnabled(not active)
+
+    def selected_project_files(self) -> list[str]:
+        selected: list[str] = []
+        for row in range(self._list.topLevelItemCount()):
+            item = self._list.topLevelItem(row)
+            if item.checkState(1) == Qt.CheckState.Checked:
+                selected.append(item.data(0, Qt.ItemDataRole.UserRole) or item.text(0))
+        return selected
 
     def _ctx(self, pos):
         item = self._list.itemAt(pos)
-        if not item or not item.text().lower().endswith(".exe"):
+        if not item or not item.text(0).lower().endswith(".exe"):
             return
-        fname = item.text()
+        fname = item.text(0)
         menu  = QMenu(self)
         act   = QAction("▶  트레이스 시작: {}".format(fname), self)
         act.triggered.connect(lambda: self._request(fname))
@@ -3548,6 +3591,13 @@ class MainWindow(QMainWindow):
         if self._is_tracing or self._trace_stopping or self._frida_worker:
             self._st("트레이스 실행/종료 처리 중입니다.")
             return
+        selected_targets = self._left.selected_project_files()
+        if not selected_targets:
+            self._st("트레이스 대상 모듈을 하나 이상 체크하세요.")
+            QMessageBox.warning(
+                self, "트레이스 대상 없음",
+                "트레이스할 Ghidra 프로젝트 모듈을 하나 이상 체크하세요.")
+            return
         self._session    = TraceSession()
         self._target_pid = None
         self._target_path = str(Path(target_path).resolve())
@@ -3555,8 +3605,10 @@ class MainWindow(QMainWindow):
         self._trace_stopping = False
         self._frida_error_dialog_shown = False
         self._left.set_tracing(True)
+        self._graph.set_project_files(selected_targets)
+        self._func_panel.set_project_files(selected_targets)
 
-        self._frida_worker = FridaWorker(target_path, self._project_files)
+        self._frida_worker = FridaWorker(target_path, selected_targets)
         self._frida_thread = QThread()
         worker = self._frida_worker
         thread = self._frida_thread
