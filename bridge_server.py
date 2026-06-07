@@ -3244,16 +3244,11 @@ class LeftPanel(QWidget):
         for f in sorted(files):
             item = QTreeWidgetItem([f, ""])
             item.setData(0, Qt.ItemDataRole.UserRole, f)
-            item.setCheckState(
-                1,
-                Qt.CheckState.Checked
-                if f.lower().endswith(".exe")
-                else Qt.CheckState.Unchecked)
-            item.setFlags(
-                item.flags()
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable)
+            item.setCheckState(1, Qt.CheckState.Checked)
+            item.setFlags(item.flags() 
+                        | Qt.ItemFlag.ItemIsUserCheckable 
+                        | Qt.ItemFlag.ItemIsEnabled 
+                        | Qt.ItemFlag.ItemIsSelectable)
             if f.lower().endswith(".exe"):
                 item.setForeground(0, Qt.GlobalColor.cyan)
             self._list.addTopLevelItem(item)

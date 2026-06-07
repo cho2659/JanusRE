@@ -141,6 +141,8 @@ let g_status_timer: ReturnType<typeof setInterval> | null = null;
 let g_thread_api: ThreadApi | null = null;
 let g_thread_observer: any = null;
 let g_module_observer: any = null;
+let g_oep_hooked = false;
+let g_oep_reached = false;
 let g_sent_events = 0;
 let g_sent_mod_events = 0;
 let g_sent_sync_events = 0;
@@ -184,11 +186,33 @@ type TargetModuleRecord = {
 const g_target_module_records: TargetModuleRecord[] = [];
 let g_classifier_module: CModule | null = null;
 let g_bitmap_test: ((bits: NativePointer, bitCount: number, offset: number) => number) | null = null;
+let g_on_block_start_callout: NativePointer | null = null;
+let g_on_branch_execute_callout: NativePointer | null = null;
+let g_drain_transitions: ((out: NativePointer, maxCount: number) => number) | null = null;
+let g_transition_drain_buffer: NativePointer | null = null;
+let g_native_last_src: NativePointer | null = null;
+let g_native_last_is_jump: NativePointer | null = null;
+let g_native_transitions: NativePointer | null = null;
+let g_native_transition_read_index: NativePointer | null = null;
+let g_native_transition_write_index: NativePointer | null = null;
+let g_native_module_records: NativePointer | null = null;
+let g_native_module_count: NativePointer | null = null;
+let g_callout_arena_current: NativePointer | null = null;
+let g_callout_arena_offset = 0;
+let g_callout_arena_size = 0;
+const g_callout_arena_chunks: NativePointer[] = [];
 
 const SESSION_ID  = generateUUID();
 const MAX_BT      = 24; // 콜스택 역추적 최대 깊이
 const FAILURE_SCAN_DELAY_MS = 50;
 const LAST_EXTERNAL_CALL_TTL_MS = 1500;
+const NATIVE_SLOT_COUNT = 4096;
+const NATIVE_QUEUE_CAPACITY = 65536;
+const NATIVE_TRANSITION_SIZE = 24;
+const NATIVE_TRANSITION_BATCH = 4096;
+const NATIVE_MODULE_CAPACITY = 1024;
+const NATIVE_MODULE_RECORD_SIZE = 32;
+const CALLOUT_ARENA_CHUNK_SIZE = 4 * 1024 * 1024;
 
 // ══════════════════════════════════════════════════════════
 // 유틸
@@ -246,25 +270,267 @@ function isTarget(mod: { name: string } | null): boolean {
   return g_targets.has(normalizedTargetName(mod.name));
 }
 
+function allocZeroed(size: number): NativePointer {
+  const mem = Memory.alloc(size);
+  mem.writeByteArray(new Uint8Array(size).buffer);
+  return mem;
+}
+
 function ensureClassifier(): void {
   if (g_bitmap_test) return;
+  g_native_last_src = allocZeroed(NATIVE_SLOT_COUNT * 8);
+  g_native_last_is_jump = allocZeroed(NATIVE_SLOT_COUNT * 4);
+  g_native_transitions = allocZeroed(NATIVE_QUEUE_CAPACITY * NATIVE_TRANSITION_SIZE);
+  g_native_transition_read_index = allocZeroed(4);
+  g_native_transition_write_index = allocZeroed(4);
+  g_native_module_records = allocZeroed(NATIVE_MODULE_CAPACITY * NATIVE_MODULE_RECORD_SIZE);
+  g_native_module_count = allocZeroed(4);
+
   g_classifier_module = new CModule(`
+    typedef unsigned int u32;
+    typedef unsigned long long u64;
+    typedef void * gpointer;
+    typedef struct _GumCpuContext GumCpuContext;
+
+    typedef struct {
+      u32 tid;
+      u32 reserved;
+      u64 start;
+    } BlockStartData;
+
+    typedef struct {
+      u32 tid;
+      u32 is_jump;
+      u64 address;
+    } BranchData;
+
+    typedef struct {
+      u32 tid;
+      u32 reserved;
+      u64 src;
+      u64 dst;
+    } TransitionRecord;
+
+    typedef struct {
+      u64 base;
+      u64 size;
+      const unsigned char *target_bits;
+      const unsigned char *function_bits;
+    } NativeTargetModuleRecord;
+
+    #define SLOT_COUNT 4096
+    #define QUEUE_CAPACITY 65536
+
+    extern u64 native_last_src[];
+    extern u32 native_last_is_jump[];
+    extern TransitionRecord native_transitions[];
+    extern volatile u32 native_transition_read_index;
+    extern volatile u32 native_transition_write_index;
+    extern NativeTargetModuleRecord native_module_records[];
+    extern volatile u32 native_module_count;
+
     int bitmap_test(const unsigned char *bits,
                     unsigned long long bit_count,
                     unsigned long long offset) {
       if (bits == 0 || offset >= bit_count) return 0;
       return (bits[offset >> 3] >> (offset & 7)) & 1;
     }
-  `);
+
+    static u32 slot_for_tid(u32 tid) {
+      return tid & (SLOT_COUNT - 1);
+    }
+
+    static int native_bitmap_test(const unsigned char *bits, u64 bit_count, u64 offset) {
+      if (bits == 0 || offset >= bit_count) return 0;
+      return (bits[offset >> 3] >> (offset & 7)) & 1;
+    }
+
+    static void classify_address(u64 address, u32 *is_target, u32 *is_function_start) {
+      u32 i;
+      *is_target = 0;
+      *is_function_start = 0;
+      for (i = 0; i < native_module_count; i++) {
+        NativeTargetModuleRecord *rec = &native_module_records[i];
+        u64 end = rec->base + rec->size;
+        if (address >= rec->base && address < end) {
+          u64 offset = address - rec->base;
+          *is_target = native_bitmap_test(rec->target_bits, rec->size, offset) != 0;
+          *is_function_start = native_bitmap_test(rec->function_bits, rec->size, offset) != 0;
+          return;
+        }
+      }
+    }
+
+    static void enqueue_transition(u32 tid, u64 src, u64 dst) {
+      u32 src_target;
+      u32 src_function_start;
+      u32 dst_target;
+      u32 dst_function_start;
+      u32 index;
+      TransitionRecord *rec;
+
+      classify_address(src, &src_target, &src_function_start);
+      classify_address(dst, &dst_target, &dst_function_start);
+      if (src_target == 0 && dst_target == 0) return;
+      if (dst_target != 0 && dst_function_start == 0) return;
+
+      index = native_transition_write_index++;
+      rec = &native_transitions[index & (QUEUE_CAPACITY - 1)];
+      rec->tid = tid;
+      rec->reserved = 0;
+      rec->src = src;
+      rec->dst = dst;
+
+      if (index - native_transition_read_index >= QUEUE_CAPACITY) {
+        native_transition_read_index = index - QUEUE_CAPACITY + 1;
+      }
+    }
+
+    void on_block_start(GumCpuContext *cpu_context, gpointer user_data) {
+      BlockStartData *data = (BlockStartData *) user_data;
+      u32 slot;
+      (void) cpu_context;
+      if (data == 0) return;
+
+      slot = slot_for_tid(data->tid);
+      if (native_last_is_jump[slot] != 0) {
+        enqueue_transition(data->tid, native_last_src[slot], data->start);
+        native_last_is_jump[slot] = 0;
+      }
+    }
+
+    void on_branch_execute(GumCpuContext *cpu_context, gpointer user_data) {
+      BranchData *data = (BranchData *) user_data;
+      u32 slot;
+      (void) cpu_context;
+      if (data == 0) return;
+
+      slot = slot_for_tid(data->tid);
+      if (data->is_jump != 0) {
+        native_last_src[slot] = data->address;
+        native_last_is_jump[slot] = 1;
+      } else {
+        native_last_is_jump[slot] = 0;
+      }
+    }
+
+    u32 drain_transitions(TransitionRecord *out, u32 max_count) {
+      u32 read_index = native_transition_read_index;
+      u32 write_index = native_transition_write_index;
+      u32 available = write_index - read_index;
+      u32 count = available < max_count ? available : max_count;
+      u32 i;
+
+      for (i = 0; i < count; i++) {
+        out[i] = native_transitions[(read_index + i) & (QUEUE_CAPACITY - 1)];
+      }
+      native_transition_read_index = read_index + count;
+      return count;
+    }
+  `, {
+    native_last_src: g_native_last_src,
+    native_last_is_jump: g_native_last_is_jump,
+    native_transitions: g_native_transitions,
+    native_transition_read_index: g_native_transition_read_index,
+    native_transition_write_index: g_native_transition_write_index,
+    native_module_records: g_native_module_records,
+    native_module_count: g_native_module_count,
+  });
   g_bitmap_test = new NativeFunction(
     (g_classifier_module as any).bitmap_test,
     "int",
     ["pointer", "uint64", "uint64"],
   ) as unknown as ((bits: NativePointer, bitCount: number, offset: number) => number);
+  g_on_block_start_callout = (g_classifier_module as any).on_block_start as NativePointer;
+  g_on_branch_execute_callout = (g_classifier_module as any).on_branch_execute as NativePointer;
+  g_drain_transitions = new NativeFunction(
+    (g_classifier_module as any).drain_transitions,
+    "uint32",
+    ["pointer", "uint32"],
+  ) as unknown as ((out: NativePointer, maxCount: number) => number);
+  g_transition_drain_buffer = Memory.alloc(NATIVE_TRANSITION_SIZE * NATIVE_TRANSITION_BATCH);
 }
 
 function pointerOffset(addr: NativePointer, base: NativePointer): number {
   return parseInt(addr.sub(base).toString(16), 16);
+}
+
+function writeU64Number(dst: NativePointer, value: number): void {
+  dst.writeU64(uint64(value));
+}
+
+function writeU64Pointer(dst: NativePointer, value: NativePointer): void {
+  dst.writeU64(0);
+  dst.writePointer(value);
+}
+
+function arenaAlloc(size: number, align: number = 8): NativePointer {
+  const alignedOffset = (g_callout_arena_offset + align - 1) & ~(align - 1);
+  if (!g_callout_arena_current
+      || alignedOffset + size > g_callout_arena_size) {
+    const chunkSize = Math.max(CALLOUT_ARENA_CHUNK_SIZE, size + align);
+    g_callout_arena_current = Memory.alloc(chunkSize);
+    g_callout_arena_chunks.push(g_callout_arena_current);
+    g_callout_arena_offset = 0;
+    g_callout_arena_size = chunkSize;
+  } else {
+    g_callout_arena_offset = alignedOffset;
+  }
+
+  const out = g_callout_arena_current.add(g_callout_arena_offset);
+  g_callout_arena_offset += size;
+  return out;
+}
+
+function allocBlockStartData(tid: number, start: NativePointer): NativePointer {
+  const data = arenaAlloc(16);
+  data.writeU32(tid);
+  data.add(4).writeU32(0);
+  writeU64Pointer(data.add(8), start);
+  return data;
+}
+
+function allocBranchData(tid: number, address: NativePointer, isJump: boolean): NativePointer {
+  const data = arenaAlloc(16);
+  data.writeU32(tid);
+  data.add(4).writeU32(isJump ? 1 : 0);
+  writeU64Pointer(data.add(8), address);
+  return data;
+}
+
+function updateNativeTargetModuleMap(): void {
+  ensureClassifier();
+  if (!g_native_module_records || !g_native_module_count) return;
+
+  const count = Math.min(g_target_module_records.length, NATIVE_MODULE_CAPACITY);
+  g_native_module_count.writeU32(0);
+  for (let i = 0; i < count; i++) {
+    const rec = g_target_module_records[i]!;
+    const out = g_native_module_records.add(i * NATIVE_MODULE_RECORD_SIZE);
+    writeU64Pointer(out, rec.base);
+    writeU64Number(out.add(8), rec.size);
+    out.add(16).writePointer(rec.targetBits);
+    out.add(24).writePointer(rec.functionBits);
+  }
+  g_native_module_count.writeU32(count);
+}
+
+function drainNativeTransitions(): void {
+  ensureClassifier();
+  if (!g_drain_transitions || !g_transition_drain_buffer) return;
+
+  while (true) {
+    const count = g_drain_transitions(g_transition_drain_buffer, NATIVE_TRANSITION_BATCH);
+    if (count <= 0) return;
+    for (let i = 0; i < count; i++) {
+      const rec = g_transition_drain_buffer.add(i * NATIVE_TRANSITION_SIZE);
+      const tid = rec.readU32();
+      const src = rec.add(8).readPointer();
+      const dst = rec.add(16).readPointer();
+      recordJumpEvent(src, dst, tid, "stalker_jump");
+    }
+    if (count < NATIVE_TRANSITION_BATCH) return;
+  }
 }
 
 function allocBitmap(bitCount: number, fill: boolean, offsets: string[] = []): NativePointer {
@@ -315,6 +581,7 @@ function rebuildTargetModuleRecords(): void {
   for (const mod of Process.enumerateModules()) {
     refreshTargetModuleRecord(mod);
   }
+  updateNativeTargetModuleMap();
 }
 
 function targetRecordForAddress(addr: NativePointer | null): TargetModuleRecord | null {
@@ -511,8 +778,23 @@ function recordJumpEvent(
 }
 
 function isJumpMnemonic(mnemonic: string): boolean {
-  const m = mnemonic.toLowerCase();
-  return m === "jmp" || /^j[a-z0-9]+$/.test(m);
+  if (mnemonic.length < 2) return false;
+  const first = mnemonic.charCodeAt(0);
+  if (first !== 0x6a && first !== 0x4a) return false; // j/J
+  if (mnemonic === "jmp" || mnemonic === "JMP") return true;
+  for (let i = 1; i < mnemonic.length; i++) {
+    const c = mnemonic.charCodeAt(i);
+    const lower = c | 0x20;
+    if (!((lower >= 0x61 && lower <= 0x7a)
+        || (c >= 0x30 && c <= 0x39))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isCallOrRetMnemonic(mnemonic: string): boolean {
+  return mnemonic === "call" || mnemonic === "ret" || mnemonic === "retf";
 }
 
 function recordBlockTransition(
@@ -711,6 +993,7 @@ function hookModules(): void {
     onAdded(mod) {
       recordLoad(mod.name, mod.base, mod.size);
       refreshTargetModuleRecord(mod);
+      updateNativeTargetModuleMap();
       if (g_targets.size > 0) hookTargetExports(mod);
       send({
         type: "status",
@@ -720,6 +1003,7 @@ function hookModules(): void {
     onRemoved(mod) {
       recordUnload(mod.name, mod.base, mod.size);
       removeTargetModuleRecord(mod);
+      updateNativeTargetModuleMap();
       send({
         type: "status",
         text: "module_observer:remove " + mod.name + " base=" + ph(mod.base),
@@ -745,6 +1029,9 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
   let ok = false;
   try {
     ok = withThreadSuspended(tid, reason, () => {
+      ensureClassifier();
+      const onBlockStart = g_on_block_start_callout!;
+      const onBranchExecute = g_on_branch_execute_callout!;
       Stalker.follow(tid, {
         events: { call: true, ret: true },
 
@@ -752,18 +1039,19 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
           let instruction = iterator.next();
           if (instruction === null) return;
 
-          const blockStart = instruction.address;
-          let blockLast = instruction;
+          iterator.putCallout(onBlockStart, allocBlockStartData(tid, instruction.address));
           do {
-            blockLast = instruction;
+            const mnemonic = instruction.mnemonic;
+            const isJump = isJumpMnemonic(mnemonic);
+            if (isJump || isCallOrRetMnemonic(mnemonic)) {
+              iterator.putCallout(
+                onBranchExecute,
+                allocBranchData(tid, instruction.address, isJump),
+              );
+            }
             iterator.keep();
             instruction = iterator.next();
           } while (instruction !== null);
-
-          const blockEndsWithJump = isJumpMnemonic(blockLast.mnemonic);
-          iterator.putCallout(() => {
-            recordBlockTransition(tid, blockStart, blockLast.address, blockEndsWithJump);
-          });
         },
 
         onReceive(evbuf: ArrayBuffer): void {
@@ -779,6 +1067,7 @@ function attachStalker(tid: number, reason: string = "unknown"): boolean {
             const target = ev[2] as NativePointer;
             recordTraceEvent(ks, loc, target, tid, "stalker");
           }
+          drainNativeTransitions();
         },
 
       });
@@ -827,16 +1116,68 @@ function scanThreads(reason: string): void {
 }
 
 function scheduleFailureScan(reason: string): void {
+  if (!g_oep_reached) {
+    send({ type: "status", text: "thread_scan_deferred reason=" + reason + " before_oep=1" });
+    return;
+  }
   setTimeout(() => scanThreads(reason), FAILURE_SCAN_DELAY_MS);
+}
+
+function findMainOep(): NativePointer | null {
+  const mainMod = Process.enumerateModules()[0];
+  if (!mainMod) return null;
+
+  try {
+    const base = mainMod.base;
+    if (base.readU16() !== 0x5a4d) return null;
+    const pe = base.add(base.add(0x3c).readU32());
+    if (pe.readU32() !== 0x00004550) return null;
+    const optional = pe.add(24);
+    const magic = optional.readU16();
+    if (magic !== 0x10b && magic !== 0x20b) return null;
+    const entryRva = optional.add(16).readU32();
+    if (entryRva === 0) return null;
+    return base.add(entryRva);
+  } catch (_) {
+    return null;
+  }
+}
+
+function markOepReached(source: string): void {
+  if (g_oep_reached) return;
+  g_oep_reached = true;
+  send({ type: "status", text: "oep_reached source=" + source });
+  scanThreads("after_oep");
+}
+
+function hookMainOep(): void {
+  if (g_oep_hooked) return;
+  g_oep_hooked = true;
+
+  const oep = findMainOep();
+  if (!oep) {
+    send({ type: "status", text: "oep_hook_failed" });
+    return;
+  }
+
+  try {
+    Interceptor.attach(oep, {
+      onEnter(_) {
+        markOepReached("main_oep");
+      },
+    });
+    send({ type: "status", text: "oep_hook address=" + ph(oep) });
+  } catch (e) {
+    send({ type: "status", text: "oep_hook_failed " + e });
+  }
 }
 
 function beginTrace(initialTids: number[] = []): void {
   if (g_started) return;
   g_started = true;
 
-  scanThreads("start_before_initial");
+  hookMainOep();
   for (const tid of initialTids) attachStalker(tid, "initial");
-  scanThreads("start_after_initial");
   send({ type: "status", text: "trace_threads=" + Array.from(g_stalked).join(",") });
   g_status_timer = setInterval(() => {
     sendTraceChunk("periodic");
@@ -875,6 +1216,10 @@ function hookThreadCreation(): void {
         start_symbol: "",
         status: "observed",
       });
+      if (!g_oep_reached) {
+        send({ type: "status", text: "thread_observer:defer_attach tid=" + tid + " reason=before_oep" });
+        return;
+      }
       if (!attachStalker(tid, "thread_observer")) {
         scheduleFailureScan("thread_observer_attach_failed");
       }
@@ -954,6 +1299,8 @@ function hookExceptions(): void {
 // ══════════════════════════════════════════════════════════
 
 function sendTraceChunk(reason: "periodic" | "exit" | "user_stop"): void {
+  drainNativeTransitions();
+
   const events = g_events.slice(g_sent_events);
   const modEvents = g_mod_events.slice(g_sent_mod_events);
   const syncEvents = g_sync_events.slice(g_sent_sync_events);
