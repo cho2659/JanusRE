@@ -21,7 +21,7 @@ codex의 미구현 코드가 존재할 것으로 의심됨 확인 후 진행 및
 
 is (in program address range && target_bitmap(address) == 1)
     is policy_bitmap(address) == 1 (offset - base address)
-        if true: don't search during runtime
+        if true: don't search during runtime (ghidra에서 확인 가능)
         else if false: frida 해당 메모리 확인 필요 (n bit 만큼 가져오기)
 
 policy_bitmap에서 1인것: (rw)
