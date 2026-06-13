@@ -1,9 +1,31 @@
+bitmap mutex 구현 필요
 
 
-resolve ordinal with ghidra export symbols
+thread suspend 교착 상태 해결 필요
+OEP 이후에도 교착 상태 (thread suspend 및 메모리 alloc 문제인 듯), load 시 lock 상태 
+SetUnhandledExceptionFilter
+-> 해결 불가의 경우 thread suspend를 제거하여 정확도를 희생 (권장 안 함)
 
-get pointer value 
-x64 register capture
-: check if it is readonly data section with bitmap (offset - base address)
-if true: don't search during runtime
-if false: search
+공유 메모리: rpc 병목 완화 # 레거시 버리기 필요
+
+스레드 별로 공유 메모리 분리 필수 (tt, tf 판단, 터널 구축에 필수)
+
+resolve ordinal with ghidra export symbols (ex) mfc dll
+
+codex의 미구현 코드가 존재할 것으로 의심됨 확인 후 진행 및 새 코드 삽입 필요 
+
+과도기라고 판단될 경우 레거시 코드 무시 후 새로 만드는 것이 필요함 (껍데기만 만들고 사기치는 경우 있으니 주의 필요)
+
+추후 x64 레지스터 캡쳐 구현 (규격이 표준화되어 쉬움 (x86은 오버헤드로 불가))
+레지스터에서 pointer value가 포함될 경우 
+
+is (in program address range && target_bitmap(address) == 1)
+    is policy_bitmap(address) == 1 (offset - base address)
+        if true: don't search during runtime
+        else if false: frida 해당 메모리 확인 필요 (n bit 만큼 가져오기)
+
+policy_bitmap에서 1인것: (rw)
+policy_bitmap에서 0인것: (!w || !r)
+
+
+현재 bitmap 총 3개 용량 프로그램 실행 메모리보다 더 필요
