@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "build": "frida-compile agent.ts -o agent.js",
-    "watch": "frida-compile agent.ts -w -o agent.js"
+    "build": "frida-compile agent.ts --bundle-format iife -o agent.js",
+    "watch": "frida-compile agent.ts --bundle-format iife -w -o agent.js"
   },
   "keywords": [],
   "author": "",
@@ -20,4 +20,3 @@
     "typescript": "^6.0.3"
   }
 }
-
