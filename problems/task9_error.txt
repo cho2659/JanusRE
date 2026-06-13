@@ -1,0 +1,2 @@
+
+Error: compilation failed: module.c:80: error: implicit declaration of function '_sync_fetch_and_add'
