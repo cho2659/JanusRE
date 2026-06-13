@@ -1,5 +1,5 @@
 📦
-36443 /agent.js
+38128 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -37,6 +37,7 @@ var require_agent = __commonJS({
     var g_module_observer = null;
     var g_oep_hooked = false;
     var g_oep_reached = false;
+    var g_stalker_cleanup_done = false;
     var g_sent_events = 0;
     var g_sent_mod_events = 0;
     var g_sent_sync_events = 0;
@@ -802,18 +803,38 @@ var require_agent = __commonJS({
       g_oep_hooked = true;
       const oep = findMainOep();
       if (!oep) {
-        send({ type: "status", text: "oep_hook_failed" });
-        return;
+        send({ type: "status", text: "oep_probe_oep_not_found" });
+      } else {
+        send({ type: "status", text: "oep_probe address=" + ph(oep) });
       }
-      try {
-        Interceptor.attach(oep, {
-          onEnter(_) {
-            markOepReached("main_oep");
-          }
-        });
-        send({ type: "status", text: "oep_hook address=" + ph(oep) });
-      } catch (e) {
-        send({ type: "status", text: "oep_hook_failed " + e });
+      let hooks = 0;
+      for (const moduleName of ["kernel32.dll", "kernelbase.dll"]) {
+        const mod = Process.findModuleByName(moduleName);
+        if (!mod)
+          continue;
+        const addr = mod.findExportByName("SetUnhandledExceptionFilter");
+        if (!addr)
+          continue;
+        try {
+          Interceptor.attach(addr, {
+            onLeave(_) {
+              markOepReached("SetUnhandledExceptionFilter_onleave");
+            }
+          });
+          hooks++;
+          send({
+            type: "status",
+            text: "oep_suef_hook module=" + moduleName + " address=" + ph(addr)
+          });
+        } catch (e) {
+          send({
+            type: "status",
+            text: "oep_suef_hook_failed module=" + moduleName + " " + e
+          });
+        }
+      }
+      if (hooks === 0) {
+        send({ type: "status", text: "oep_suef_hook_failed no_export=1" });
       }
     }
     function beginTrace(initialTids = []) {
@@ -978,6 +999,7 @@ var require_agent = __commonJS({
         text: "flush_send hook=" + (hookName || "unknown") + " reason=" + reason + " events=" + g_events.length + " modules=" + g_mod_events.length
       });
       sendTraceChunk(reason);
+      cleanupStalkers(reason);
       send({
         type: "trace_complete",
         session_id: SESSION_ID,
@@ -990,6 +1012,39 @@ var require_agent = __commonJS({
         handle_events: [],
         exception_events: []
       });
+    }
+    function cleanupStalkers(reason) {
+      if (g_stalker_cleanup_done)
+        return;
+      g_stalker_cleanup_done = true;
+      let unfollowed = 0;
+      let failed = 0;
+      for (const tid of Array.from(g_stalked)) {
+        try {
+          Stalker.unfollow(tid);
+          unfollowed++;
+        } catch (e) {
+          failed++;
+          send({
+            type: "status",
+            text: "stalker_unfollow_failed:tid=" + tid + " reason=" + reason + " " + e
+          });
+        }
+      }
+      g_stalked.clear();
+      g_attach_failed.clear();
+      try {
+        Stalker.garbageCollect();
+        send({
+          type: "status",
+          text: "stalker_cleanup reason=" + reason + " unfollowed=" + unfollowed + " failed=" + failed
+        });
+      } catch (e) {
+        send({
+          type: "status",
+          text: "stalker_garbage_collect_failed reason=" + reason + " " + e
+        });
+      }
     }
     rpc.exports = {
       stopTrace() {

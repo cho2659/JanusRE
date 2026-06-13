@@ -1,0 +1,9 @@
+
+
+resolve ordinal with ghidra export symbols
+
+get pointer value 
+x64 register capture
+: check if it is readonly data section with bitmap (offset - base address)
+if true: don't search during runtime
+if false: search

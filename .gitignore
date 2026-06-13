@@ -46,6 +46,7 @@ Desktop.ini
 # Local-only project clutter
 old/
 agent/
+gemini/
 
 # Runtime bundle note:
 # frida_agent/agent.js is intentionally not ignored because bridge_server.py
