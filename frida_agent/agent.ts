@@ -204,6 +204,11 @@ let g_callout_arena_size = 0;
 const g_callout_arena_chunks: NativePointer[] = [];
 
 const SESSION_ID  = generateUUID();
+const BOOTSTRAP_SHM_NAME = "__FRIDA_DELTA_SHM_NAME__";
+const BOOTSTRAP_WAKE_EVENT_NAME = "__FRIDA_DELTA_WAKE_EVENT_NAME__";
+const BOOTSTRAP_SHM_SIZE_TEXT = "__FRIDA_DELTA_SHM_SIZE__";
+const BOOTSTRAP_MAIN_PID_TEXT = "__FRIDA_DELTA_MAIN_PID__";
+const BOOTSTRAP_MAIN_TID_TEXT = "__FRIDA_DELTA_MAIN_TID__";
 const MAX_BT      = 24; // 콜스택 역추적 최대 깊이
 const FAILURE_SCAN_DELAY_MS = 50;
 const LAST_EXTERNAL_CALL_TTL_MS = 1500;
@@ -1212,6 +1217,14 @@ function beginTrace(initialTids: number[] = []): void {
   }, 1000);
 }
 
+function enumerateInitialThreadIds(): number[] {
+  try {
+    return Process.enumerateThreads().map(t => t.id);
+  } catch (_) {
+    return [];
+  }
+}
+
 // ══════════════════════════════════════════════════════════
 // 스레드 관찰
 // ══════════════════════════════════════════════════════════
@@ -1422,55 +1435,6 @@ function cleanupStalkers(reason: string): void {
 }
 
 // ══════════════════════════════════════════════════════════
-// RPC
-// ══════════════════════════════════════════════════════════
-
-rpc.exports = {
-  stopTrace(): void { flushAndSend("user_stop"); },
-
-  startTrace(initialTids?: number[]): void {
-    beginTrace(initialTids ?? []);
-  },
-
-  /**
-   * 타겟 모듈 목록 주입. frida_bridge_server.py가 세션 시작 후 호출.
-   * project_info에서 받은 파일명 목록 (소문자).
-   */
-  setTargets(targets: string[]): void {
-    g_targets = new Set(targets.map(t => normalizedTargetName(t)));
-    // 메인 EXE는 항상 포함
-    const mainMod = Process.enumerateModules()[0];
-    if (mainMod) g_targets.add(normalizedTargetName(mainMod.name));
-    rebuildTargetModuleRecords();
-    hookLoadedTargetExports();
-    send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
-  },
-
-  setTargetConfig(configs: TargetModuleConfig[]): void {
-    g_targets = new Set();
-    g_function_starts_by_module.clear();
-    for (const cfg of configs) {
-      if (!cfg.trace) continue;
-      const name = normalizedTargetName(cfg.name);
-      g_targets.add(name);
-      g_function_starts_by_module.set(
-        name, (cfg.function_starts || []).map(v => String(v)));
-    }
-    rebuildTargetModuleRecords();
-    hookLoadedTargetExports();
-    let starts = 0;
-    for (const offsets of g_function_starts_by_module.values()) {
-      starts += offsets.length;
-    }
-    send({
-      type: "status",
-      text: "target_config modules=" + Array.from(g_targets).join(",")
-        + " function_starts=" + starts,
-    });
-  },
-};
-
-// ══════════════════════════════════════════════════════════
 // 진입점
 // ══════════════════════════════════════════════════════════
 
@@ -1482,6 +1446,14 @@ rpc.exports = {
   Stalker.queueDrainInterval = 0;
   Stalker.trustThreshold = -1;
   send({ type: "status", text: "agent:start session=" + SESSION_ID + " arch=" + Process.arch });
+  send({
+    type: "status",
+    text: "bootstrap shm=" + BOOTSTRAP_SHM_NAME
+      + " wake=" + BOOTSTRAP_WAKE_EVENT_NAME
+      + " size=" + BOOTSTRAP_SHM_SIZE_TEXT
+      + " main_pid=" + BOOTSTRAP_MAIN_PID_TEXT
+      + " main_tid=" + BOOTSTRAP_MAIN_TID_TEXT,
+  });
 
   // 메인 EXE를 초기 타겟으로
   const mainMod = Process.enumerateModules()[0];
@@ -1491,4 +1463,7 @@ rpc.exports = {
   hookThreadCreation();
   hookExceptions();
   hookExit();
+  rebuildTargetModuleRecords();
+  hookLoadedTargetExports();
+  beginTrace(enumerateInitialThreadIds());
 })();

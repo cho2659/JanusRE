@@ -2584,6 +2584,18 @@ class SharedTraceMemory:
             "FRIDA_DELTA_MAIN_TID": self.main_tid,
         }
 
+    def apply_bootstrap(self, source: str) -> str:
+        def esc(value: str) -> str:
+            return value.replace("\\", "\\\\").replace('"', '\\"')
+
+        return (source
+                .replace("__FRIDA_DELTA_SHM_NAME__", esc(self.name))
+                .replace("__FRIDA_DELTA_WAKE_EVENT_NAME__",
+                         esc(self.wake_event_name))
+                .replace("__FRIDA_DELTA_SHM_SIZE__", str(self.size))
+                .replace("__FRIDA_DELTA_MAIN_PID__", str(self.main_pid))
+                .replace("__FRIDA_DELTA_MAIN_TID__", str(self.main_tid)))
+
     def request_stop(self) -> None:
         self._write_u32("command", SHM_COMMAND_STOP)
         self._write_u32("state", SHM_STATE_STOP_REQUESTED)
@@ -2930,6 +2942,7 @@ class FridaWorker(QObject):
                 self._shared_trace.name,
                 self._shared_trace.wake_event_name,
                 self._shared_trace.size))
+            src = self._shared_trace.apply_bootstrap(src)
             dbg("frida.attach begin: pid={}".format(self._pid))
             self._session = frida.attach(self._pid)
             self._session.on("detached", self._on_detached)
@@ -2939,19 +2952,6 @@ class FridaWorker(QObject):
             dbg("script.load begin")
             self._script.load()
             dbg("script.load ok")
-            if self._target_configs:
-                dbg("set_target_config begin: count={}".format(
-                    len(self._target_configs)))
-                self._script.exports_sync.set_target_config(
-                    self._target_configs)
-                dbg("set_target_config ok")
-            elif self._project_files:
-                dbg("set_targets begin: count={}".format(len(self._project_files)))
-                self._script.exports_sync.set_targets(self._project_files)
-                dbg("set_targets ok")
-            dbg("start_trace rpc begin before resume: tids={}".format(initial_tids))
-            self._script.exports_sync.start_trace(initial_tids)
-            dbg("start_trace rpc ok before resume")
             dbg("frida.resume begin: pid={}".format(self._pid))
             frida.resume(self._pid)
             resumed = True
@@ -2988,35 +2988,11 @@ class FridaWorker(QObject):
                 dbg("shared trace stop request failed: {!r}".format(e))
 
         if self._script and not self._done:
-            done = threading.Event()
-            errors: list[Exception] = []
-
-            def request_stop():
-                try:
-                    dbg("stop_trace rpc begin")
-                    self._script.exports_sync.stop_trace()
-                    dbg("stop_trace rpc ok")
-                except Exception as e:
-                    dbg("stop_trace rpc exception: {!r}".format(e))
-                    errors.append(e)
-                finally:
-                    done.set()
-
-            t = threading.Thread(
-                target=request_stop, name="FridaStopTrace", daemon=True)
-            t.start()
-            done.wait(timeout=1.5)
-            if not done.is_set():
-                dbg("stop_trace rpc timeout")
-                self.status_changed.emit("stop RPC 지연 - 계측만 분리")
-            elif errors and not self._done:
-                self.status_changed.emit("stop: {}".format(errors[0]))
+            dbg("waiting trace_complete after shared stop request")
+            if self._trace_done_event.wait(timeout=1.0):
+                dbg("trace_complete received after shared stop request")
             else:
-                dbg("waiting trace_complete after stop rpc")
-                if self._trace_done_event.wait(timeout=1.0):
-                    dbg("trace_complete received after stop rpc")
-                else:
-                    dbg("trace_complete wait timeout after stop rpc")
+                dbg("trace_complete wait timeout after shared stop request")
 
         if not self._done:
             if self._has_cached_payload():

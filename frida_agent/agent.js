@@ -1,5 +1,5 @@
 📦
-38128 /agent.js
+37444 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -69,6 +69,11 @@ var require_agent = __commonJS({
     var g_callout_arena_size = 0;
     var g_callout_arena_chunks = [];
     var SESSION_ID = generateUUID();
+    var BOOTSTRAP_SHM_NAME = "__FRIDA_DELTA_SHM_NAME__";
+    var BOOTSTRAP_WAKE_EVENT_NAME = "__FRIDA_DELTA_WAKE_EVENT_NAME__";
+    var BOOTSTRAP_SHM_SIZE_TEXT = "__FRIDA_DELTA_SHM_SIZE__";
+    var BOOTSTRAP_MAIN_PID_TEXT = "__FRIDA_DELTA_MAIN_PID__";
+    var BOOTSTRAP_MAIN_TID_TEXT = "__FRIDA_DELTA_MAIN_TID__";
     var FAILURE_SCAN_DELAY_MS = 50;
     var NATIVE_SLOT_COUNT = 4096;
     var NATIVE_QUEUE_CAPACITY = 65536;
@@ -853,6 +858,13 @@ var require_agent = __commonJS({
         });
       }, 1e3);
     }
+    function enumerateInitialThreadIds() {
+      try {
+        return Process.enumerateThreads().map((t) => t.id);
+      } catch (_) {
+        return [];
+      }
+    }
     function hookThreadCreation() {
       if (g_thread_observer)
         return;
@@ -1046,48 +1058,6 @@ var require_agent = __commonJS({
         });
       }
     }
-    rpc.exports = {
-      stopTrace() {
-        flushAndSend("user_stop");
-      },
-      startTrace(initialTids) {
-        beginTrace(initialTids ?? []);
-      },
-      /**
-       * 타겟 모듈 목록 주입. frida_bridge_server.py가 세션 시작 후 호출.
-       * project_info에서 받은 파일명 목록 (소문자).
-       */
-      setTargets(targets) {
-        g_targets = new Set(targets.map((t) => normalizedTargetName(t)));
-        const mainMod = Process.enumerateModules()[0];
-        if (mainMod)
-          g_targets.add(normalizedTargetName(mainMod.name));
-        rebuildTargetModuleRecords();
-        hookLoadedTargetExports();
-        send({ type: "status", text: "targets=" + Array.from(g_targets).join(",") });
-      },
-      setTargetConfig(configs) {
-        g_targets = /* @__PURE__ */ new Set();
-        g_function_starts_by_module.clear();
-        for (const cfg of configs) {
-          if (!cfg.trace)
-            continue;
-          const name = normalizedTargetName(cfg.name);
-          g_targets.add(name);
-          g_function_starts_by_module.set(name, (cfg.function_starts || []).map((v) => String(v)));
-        }
-        rebuildTargetModuleRecords();
-        hookLoadedTargetExports();
-        let starts = 0;
-        for (const offsets of g_function_starts_by_module.values()) {
-          starts += offsets.length;
-        }
-        send({
-          type: "status",
-          text: "target_config modules=" + Array.from(g_targets).join(",") + " function_starts=" + starts
-        });
-      }
-    };
     (function main() {
       if (Process.arch !== "x64" && Process.arch !== "ia32") {
         throw new Error("unsupported architecture: " + Process.arch + " (x64/ia32 required)");
@@ -1095,6 +1065,10 @@ var require_agent = __commonJS({
       Stalker.queueDrainInterval = 0;
       Stalker.trustThreshold = -1;
       send({ type: "status", text: "agent:start session=" + SESSION_ID + " arch=" + Process.arch });
+      send({
+        type: "status",
+        text: "bootstrap shm=" + BOOTSTRAP_SHM_NAME + " wake=" + BOOTSTRAP_WAKE_EVENT_NAME + " size=" + BOOTSTRAP_SHM_SIZE_TEXT + " main_pid=" + BOOTSTRAP_MAIN_PID_TEXT + " main_tid=" + BOOTSTRAP_MAIN_TID_TEXT
+      });
       const mainMod = Process.enumerateModules()[0];
       if (mainMod)
         g_targets.add(normalizedTargetName(mainMod.name));
@@ -1102,6 +1076,9 @@ var require_agent = __commonJS({
       hookThreadCreation();
       hookExceptions();
       hookExit();
+      rebuildTargetModuleRecords();
+      hookLoadedTargetExports();
+      beginTrace(enumerateInitialThreadIds());
     })();
   }
 });
