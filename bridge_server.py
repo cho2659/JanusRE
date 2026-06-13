@@ -2608,15 +2608,20 @@ class SharedTraceMemory:
         self, kind: int, tid: int, seq: int, src: int, dst: int,
         flags: int = 0, aux0: int = 0, aux1: int = 0, aux2: int = 0,
     ) -> None:
-        read_index = self._read_u64("read_index")
-        write_index = self._read_u64("write_index")
-        if write_index - read_index >= self.record_capacity:
-            self._write_u64("dropped_count", self._read_u64("dropped_count") + 1)
-            if self.config_flags & SHM_FLAG_BLOCK_ON_FULL:
+        while True:
+            read_index = self._read_u64("read_index")
+            write_index = self._read_u64("write_index")
+            if write_index - read_index < self.record_capacity:
+                break
+            if not (self.config_flags & SHM_FLAG_BLOCK_ON_FULL):
                 self._write_u64(
-                    "blocking_wait_count",
-                    self._read_u64("blocking_wait_count") + 1)
-            return
+                    "dropped_count", self._read_u64("dropped_count") + 1)
+                return
+            self._write_u64(
+                "blocking_wait_count",
+                self._read_u64("blocking_wait_count") + 1)
+            self._wake_event.signal()
+            time.sleep(0)
 
         slot = write_index % self.record_capacity
         base = self._event_ring_offset() + slot * SHM_EVENT_RECORD_SIZE
@@ -2664,6 +2669,9 @@ class SharedTraceMemory:
             read_index += 1
         self._write_u64("read_index", read_index)
         return out
+
+    def has_unread_events(self) -> bool:
+        return self._read_u64("read_index") < self._read_u64("write_index")
 
     def _build_layout(self) -> dict[str, int]:
         module_count = len(self.target_configs)
@@ -2907,6 +2915,8 @@ class FridaWorker(QObject):
         self._chunk_exception_events: list[dict] = []
         self._session_id: Optional[str] = None
         self._shared_trace: Optional[SharedTraceMemory] = None
+        self._shared_collector_stop = threading.Event()
+        self._shared_collector_thread: Optional[threading.Thread] = None
 
     def start_trace(self):
         dbg("start_trace requested: target={}".format(self._target))
@@ -2937,11 +2947,13 @@ class FridaWorker(QObject):
             initial_tids  = enumerate_process_threads(self._pid)
             main_tid = initial_tids[0] if initial_tids else 0
             self._shared_trace = SharedTraceMemory(
-                int(self._pid), int(main_tid), self._target_configs)
+                int(self._pid), int(main_tid), self._target_configs,
+                blocking=True)
             dbg("shared trace created: name={} wake={} size={}".format(
                 self._shared_trace.name,
                 self._shared_trace.wake_event_name,
                 self._shared_trace.size))
+            self._start_shared_collector()
             src = self._shared_trace.apply_bootstrap(src)
             dbg("frida.attach begin: pid={}".format(self._pid))
             self._session = frida.attach(self._pid)
@@ -2987,16 +2999,9 @@ class FridaWorker(QObject):
             except Exception as e:
                 dbg("shared trace stop request failed: {!r}".format(e))
 
-        if self._script and not self._done:
-            dbg("waiting trace_complete after shared stop request")
-            if self._trace_done_event.wait(timeout=1.0):
-                dbg("trace_complete received after shared stop request")
-            else:
-                dbg("trace_complete wait timeout after shared stop request")
-
         if not self._done:
             if self._has_cached_payload():
-                dbg("finalize from cached chunks after stop fallback")
+                dbg("finalize from shared memory after stop fallback")
                 self._done = True
                 self._trace_done_event.set()
                 self.trace_complete.emit(self._build_session("user_stop"))
@@ -3027,26 +3032,6 @@ class FridaWorker(QObject):
 
         if mt == "status":
             self.status_changed.emit(pl.get("text", ""))
-        elif mt == "trace_chunk":
-            self._append_trace_payload(pl)
-            self.status_changed.emit(
-                "trace chunk raw:{} mod:{} sync:{}".format(
-                    len(pl.get("events", [])),
-                    len(pl.get("mod_events", [])),
-                    len(pl.get("sync_events", []))))
-
-        elif mt == "trace_complete":
-            self._append_trace_payload(pl)
-            self._done = True
-            self._trace_done_event.set()
-            sess = self._build_session(pl.get("reason", "exit"))
-
-            self.trace_complete.emit(sess)
-            self.status_changed.emit(
-                "완료 raw:{} → dedup:{}".format(
-                    len(sess.raw_events), len(sess.events)))
-            self._cleanup()
-            self._finish()
 
     def _on_detached(self, *args):
         dbg("frida detached: {}".format(args))
@@ -3063,7 +3048,57 @@ class FridaWorker(QObject):
         self._cleanup()
         self._finish()
 
+    def _start_shared_collector(self) -> None:
+        if not self._shared_trace or self._shared_collector_thread:
+            return
+        self._shared_collector_stop.clear()
+        self._shared_collector_thread = threading.Thread(
+            target=self._shared_collector_loop,
+            name="FridaSharedTraceCollector",
+            daemon=True,
+        )
+        self._shared_collector_thread.start()
+
+    def _shared_collector_loop(self) -> None:
+        while not self._shared_collector_stop.is_set():
+            shm = self._shared_trace
+            if shm is None:
+                break
+            try:
+                shm.wait_for_wakeup(100)
+                drained = self._drain_shared_events()
+                if drained:
+                    dbg("shared trace drained: {}".format(drained))
+            except Exception as e:
+                dbg("shared trace collector exception: {!r}".format(e))
+                time.sleep(0.05)
+        try:
+            self._drain_shared_events()
+        except Exception as e:
+            dbg("shared trace final collector drain exception: {!r}".format(e))
+
+    def _stop_shared_collector(self) -> None:
+        self._shared_collector_stop.set()
+        thread = self._shared_collector_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._shared_collector_thread = None
+
+    def _drain_shared_events_locked(self) -> int:
+        if not self._shared_trace:
+            return 0
+        events = self._shared_trace.drain_events()
+        if events:
+            self._chunk_events.extend(events)
+        return len(events)
+
+    def _drain_shared_events(self) -> int:
+        with self._chunk_lock:
+            return self._drain_shared_events_locked()
+
     def _has_cached_payload(self) -> bool:
+        if self._shared_trace:
+            return True
         with self._chunk_lock:
             return bool(
                 self._chunk_events
@@ -3074,35 +3109,9 @@ class FridaWorker(QObject):
                 or self._chunk_exception_events
             )
 
-    def _append_trace_payload(self, pl: dict):
-        with self._chunk_lock:
-            self._session_id = pl.get("session_id", self._session_id)
-            sent_at_ms = pl.get("sent_at_ms")
-            if sent_at_ms is None:
-                sent_at_ms = int(time.time() * 1000)
-            for key in (
-                "events", "mod_events", "sync_events",
-                "spawn_events", "handle_events", "exception_events"):
-                for ev in pl.get(key, []):
-                    if isinstance(ev, dict) and "sent_at_ms" not in ev:
-                        ev["sent_at_ms"] = sent_at_ms
-            self._chunk_events.extend(pl.get("events", []))
-            self._chunk_mod_events.extend(pl.get("mod_events", []))
-            self._chunk_sync_events.extend(pl.get("sync_events", []))
-            self._chunk_spawn_events.extend(pl.get("spawn_events", []))
-            self._chunk_handle_events.extend(pl.get("handle_events", []))
-            self._chunk_exception_events.extend(
-                pl.get("exception_events", []))
-            dbg("chunk cache totals raw:{} mod:{} sync:{} spawn:{} handle:{} exception:{}".format(
-                len(self._chunk_events),
-                len(self._chunk_mod_events),
-                len(self._chunk_sync_events),
-                len(self._chunk_spawn_events),
-                len(self._chunk_handle_events),
-                len(self._chunk_exception_events)))
-
     def _build_session(self, reason: str) -> TraceSession:
         with self._chunk_lock:
+            self._drain_shared_events_locked()
             raw = list(self._chunk_events)
             mods = list(self._chunk_mod_events)
             sync_events = list(self._chunk_sync_events)
@@ -3131,6 +3140,7 @@ class FridaWorker(QObject):
 
     def _cleanup(self):
         dbg("cleanup begin")
+        self._stop_shared_collector()
         if self._shared_trace:
             try:
                 dbg("shared trace close begin")
