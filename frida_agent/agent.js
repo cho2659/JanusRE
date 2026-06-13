@@ -1,5 +1,5 @@
 📦
-37444 /agent.js
+37464 /agent.js
 ✄
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
@@ -1078,7 +1078,7 @@ var require_agent = __commonJS({
       hookExit();
       rebuildTargetModuleRecords();
       hookLoadedTargetExports();
-      beginTrace(enumerateInitialThreadIds());
+      setImmediate(() => beginTrace(enumerateInitialThreadIds()));
     })();
   }
 });

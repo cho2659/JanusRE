@@ -1465,5 +1465,5 @@ function cleanupStalkers(reason: string): void {
   hookExit();
   rebuildTargetModuleRecords();
   hookLoadedTargetExports();
-  beginTrace(enumerateInitialThreadIds());
+  setImmediate(() => beginTrace(enumerateInitialThreadIds()));
 })();
