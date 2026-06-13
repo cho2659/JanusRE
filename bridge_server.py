@@ -41,8 +41,10 @@ import bisect
 import ctypes
 import json
 import math
+import mmap
 import os
 import socket
+import struct
 import threading
 import time
 import uuid
@@ -2426,6 +2428,368 @@ def terminate_process_if_image_matches(pid: int, expected_path: str) -> bool:
 
 
 # ============================================================
+# Shared memory trace ABI (Task #9)
+# ============================================================
+
+SHM_MAGIC = 0x46445348  # FDSH
+SHM_VERSION = 1
+SHM_HEADER_SIZE = 0x100
+SHM_MODULE_RECORD_SIZE = 48
+SHM_EVENT_RECORD_SIZE = 64
+SHM_DEFAULT_RECORD_CAPACITY = 65536
+SHM_DEFAULT_CALLOUT_ARENA_SIZE = 4 * 1024 * 1024
+
+SHM_STATE_CONFIG_READY = 1
+SHM_STATE_STOP_REQUESTED = 5
+
+SHM_COMMAND_NONE = 0
+SHM_COMMAND_STOP = 1
+
+SHM_FLAG_BLOCK_ON_FULL = 1 << 0
+SHM_FLAG_DOUBLE_BUFFERING = 1 << 1
+SHM_FLAG_WAKE_ON_HIGH_WATERMARK = 1 << 2
+
+SHM_HEADER_OFFSETS = {
+    "state": 0x08,
+    "command": 0x0C,
+    "config_flags": 0x10,
+    "main_pid": 0x18,
+    "main_tid": 0x1C,
+    "write_index": 0x28,
+    "read_index": 0x30,
+    "dropped_count": 0x38,
+    "record_size": 0x40,
+    "record_capacity": 0x44,
+    "module_table_offset": 0x48,
+    "module_count": 0x4C,
+    "module_record_size": 0x50,
+    "function_bitmap_offset": 0x54,
+    "function_bitmap_size": 0x58,
+    "callout_arena_offset": 0x5C,
+    "callout_arena_size": 0x60,
+    "callout_arena_write_offset": 0x64,
+    "event_ring0_offset": 0x68,
+    "event_ring1_offset": 0x78,
+    "active_write_buffer": 0x7C,
+    "active_read_buffer": 0x80,
+    "high_watermark_percent": 0x84,
+    "wake_event_signal_count": 0x88,
+    "blocking_wait_count": 0x90,
+}
+
+
+def _align(value: int, alignment: int = 8) -> int:
+    return (value + alignment - 1) & ~(alignment - 1)
+
+
+def _parse_hex_int(value: object) -> Optional[int]:
+    try:
+        return int(str(value), 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stable_name_hash(name: str) -> int:
+    h = 2166136261
+    normalized = str(name or "").lower().replace("\\", "/").split("/")[-1]
+    for ch in normalized.encode("utf-8", "ignore"):
+        h ^= ch
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+class _WindowsEvent:
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+
+    def __init__(self, name: str):
+        self.name = name
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._kernel32.CreateEventW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        self._kernel32.CreateEventW.restype = wintypes.HANDLE
+        self._kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        self._kernel32.SetEvent.restype = wintypes.BOOL
+        self._kernel32.WaitForSingleObject.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD]
+        self._kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._kernel32.CloseHandle.restype = wintypes.BOOL
+        self._handle = self._kernel32.CreateEventW(
+            None, False, False, self.name)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def signal(self) -> None:
+        if not self._kernel32.SetEvent(self._handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def wait(self, timeout_ms: int) -> bool:
+        rv = self._kernel32.WaitForSingleObject(self._handle, timeout_ms)
+        if rv == self.WAIT_OBJECT_0:
+            return True
+        if rv == self.WAIT_TIMEOUT:
+            return False
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+class SharedTraceMemory:
+    def __init__(
+        self,
+        main_pid: int,
+        main_tid: int,
+        target_configs: Optional[list[dict]] = None,
+        *,
+        record_capacity: int = SHM_DEFAULT_RECORD_CAPACITY,
+        blocking: bool = False,
+        double_buffering: bool = True,
+        high_watermark_percent: int = 80,
+    ):
+        self.main_pid = int(main_pid)
+        self.main_tid = int(main_tid)
+        self.target_configs = target_configs or []
+        self.record_capacity = int(record_capacity)
+        self.high_watermark_percent = int(high_watermark_percent)
+        self.config_flags = SHM_FLAG_WAKE_ON_HIGH_WATERMARK
+        if blocking:
+            self.config_flags |= SHM_FLAG_BLOCK_ON_FULL
+        if double_buffering:
+            self.config_flags |= SHM_FLAG_DOUBLE_BUFFERING
+        nonce = uuid.uuid4().hex
+        self.name = "Local\\frida_delta_{}_{}".format(self.main_pid, nonce)
+        self.wake_event_name = self.name + "_wake"
+        self._wake_event = _WindowsEvent(self.wake_event_name)
+        self._layout = self._build_layout()
+        self.size = self._layout["total_size"]
+        self._map = mmap.mmap(-1, self.size, tagname=self.name)
+        self._initialize()
+
+    def close(self) -> None:
+        try:
+            self._map.close()
+        finally:
+            self._wake_event.close()
+
+    def bootstrap_values(self) -> dict[str, object]:
+        return {
+            "FRIDA_DELTA_SHM_NAME": self.name,
+            "FRIDA_DELTA_SHM_SIZE": self.size,
+            "FRIDA_DELTA_WAKE_EVENT_NAME": self.wake_event_name,
+            "FRIDA_DELTA_MAIN_PID": self.main_pid,
+            "FRIDA_DELTA_MAIN_TID": self.main_tid,
+        }
+
+    def request_stop(self) -> None:
+        self._write_u32("command", SHM_COMMAND_STOP)
+        self._write_u32("state", SHM_STATE_STOP_REQUESTED)
+        self._wake_event.signal()
+
+    def wait_for_wakeup(self, timeout_ms: int = 100) -> bool:
+        return self._wake_event.wait(timeout_ms)
+
+    def write_synthetic_event(
+        self, kind: int, tid: int, seq: int, src: int, dst: int,
+        flags: int = 0, aux0: int = 0, aux1: int = 0, aux2: int = 0,
+    ) -> None:
+        read_index = self._read_u64("read_index")
+        write_index = self._read_u64("write_index")
+        if write_index - read_index >= self.record_capacity:
+            self._write_u64("dropped_count", self._read_u64("dropped_count") + 1)
+            if self.config_flags & SHM_FLAG_BLOCK_ON_FULL:
+                self._write_u64(
+                    "blocking_wait_count",
+                    self._read_u64("blocking_wait_count") + 1)
+            return
+
+        slot = write_index % self.record_capacity
+        base = self._event_ring_offset() + slot * SHM_EVENT_RECORD_SIZE
+        struct.pack_into(
+            "<HHIQQQQQQ", self._map, base,
+            int(kind) & 0xFFFF,
+            int(flags) & 0xFFFF,
+            int(tid) & 0xFFFFFFFF,
+            int(seq) & 0xFFFFFFFFFFFFFFFF,
+            int(src) & 0xFFFFFFFFFFFFFFFF,
+            int(dst) & 0xFFFFFFFFFFFFFFFF,
+            int(aux0) & 0xFFFFFFFFFFFFFFFF,
+            int(aux1) & 0xFFFFFFFFFFFFFFFF,
+            int(aux2) & 0xFFFFFFFFFFFFFFFF,
+        )
+        struct.pack_into("<Q", self._map, base + 0x38, 0)
+        self._write_u64("write_index", write_index + 1)
+        if write_index + 1 - read_index >= self._high_watermark_count():
+            self._write_u64(
+                "wake_event_signal_count",
+                self._read_u64("wake_event_signal_count") + 1)
+            self._wake_event.signal()
+
+    def drain_events(self) -> list[dict]:
+        out: list[dict] = []
+        read_index = self._read_u64("read_index")
+        write_index = self._read_u64("write_index")
+        while read_index < write_index:
+            slot = read_index % self.record_capacity
+            base = self._event_ring_offset() + slot * SHM_EVENT_RECORD_SIZE
+            kind, flags, tid, seq, src, dst, aux0, aux1, aux2 = (
+                struct.unpack_from("<HHIQQQQQQ", self._map, base))
+            if kind <= 2:
+                out.append({
+                    "k": int(kind),
+                    "src": "0x{:X}".format(src),
+                    "dst": "0x{:X}".format(dst),
+                    "tid": int(tid),
+                    "seq": int(seq),
+                    "src_tt": bool(flags & 0x1),
+                    "dst_tt": bool(flags & 0x2),
+                    "is_jump": bool(flags & 0x4),
+                    "source": "shared_memory",
+                })
+            read_index += 1
+        self._write_u64("read_index", read_index)
+        return out
+
+    def _build_layout(self) -> dict[str, int]:
+        module_count = len(self.target_configs)
+        module_table_offset = SHM_HEADER_SIZE
+        module_table_size = module_count * SHM_MODULE_RECORD_SIZE
+        function_bitmap_offset = _align(module_table_offset + module_table_size)
+        function_bitmap_size = self._function_bitmap_size()
+        callout_arena_offset = _align(function_bitmap_offset + function_bitmap_size)
+        event_ring0_offset = _align(
+            callout_arena_offset + SHM_DEFAULT_CALLOUT_ARENA_SIZE)
+        ring_size = self.record_capacity * SHM_EVENT_RECORD_SIZE
+        event_ring1_offset = _align(event_ring0_offset + ring_size)
+        total_size = _align(event_ring1_offset + ring_size)
+        return {
+            "module_table_offset": module_table_offset,
+            "module_count": module_count,
+            "function_bitmap_offset": function_bitmap_offset,
+            "function_bitmap_size": function_bitmap_size,
+            "callout_arena_offset": callout_arena_offset,
+            "event_ring0_offset": event_ring0_offset,
+            "event_ring1_offset": event_ring1_offset,
+            "total_size": total_size,
+        }
+
+    def _function_bitmap_size(self) -> int:
+        total = 0
+        for cfg in self.target_configs:
+            max_offset = 0
+            for off_text in cfg.get("function_starts", []) or []:
+                offset = _parse_hex_int(off_text)
+                if offset is not None:
+                    max_offset = max(max_offset, offset)
+            total += max(1, (max_offset + 8) // 8)
+        return _align(total)
+
+    def _initialize(self) -> None:
+        self._map[:] = b"\x00" * self.size
+        struct.pack_into("<IHH", self._map, 0, SHM_MAGIC, SHM_VERSION, SHM_HEADER_SIZE)
+        self._write_u32("state", SHM_STATE_CONFIG_READY)
+        self._write_u32("command", SHM_COMMAND_NONE)
+        self._write_u32("config_flags", self.config_flags)
+        self._write_u32("main_pid", self.main_pid)
+        self._write_u32("main_tid", self.main_tid)
+        self._write_u32("record_size", SHM_EVENT_RECORD_SIZE)
+        self._write_u32("record_capacity", self.record_capacity)
+        self._write_u32("module_table_offset", self._layout["module_table_offset"])
+        self._write_u32("module_count", self._layout["module_count"])
+        self._write_u32("module_record_size", SHM_MODULE_RECORD_SIZE)
+        self._write_u32("function_bitmap_offset", self._layout["function_bitmap_offset"])
+        self._write_u32("function_bitmap_size", self._layout["function_bitmap_size"])
+        self._write_u32("callout_arena_offset", self._layout["callout_arena_offset"])
+        self._write_u32("callout_arena_size", SHM_DEFAULT_CALLOUT_ARENA_SIZE)
+        self._write_u32("event_ring0_offset", self._layout["event_ring0_offset"])
+        self._write_u32("event_ring1_offset", self._layout["event_ring1_offset"])
+        self._write_u32("active_write_buffer", 0)
+        self._write_u32("active_read_buffer", 0)
+        self._write_u32("high_watermark_percent", self.high_watermark_percent)
+        self._write_module_table()
+
+    def _write_module_table(self) -> None:
+        table = self._layout["module_table_offset"]
+        bitmap_cursor = self._layout["function_bitmap_offset"]
+        for i, cfg in enumerate(self.target_configs):
+            starts = cfg.get("function_starts", []) or []
+            max_offset = 0
+            parsed_offsets: list[int] = []
+            for off_text in starts:
+                offset = _parse_hex_int(off_text)
+                if offset is None:
+                    continue
+                parsed_offsets.append(offset)
+                max_offset = max(max_offset, offset)
+            bit_count = max_offset + 1 if parsed_offsets else 0
+            byte_count = max(1, (max_offset + 8) // 8)
+            for offset in parsed_offsets:
+                byte_index = bitmap_cursor + (offset >> 3)
+                value = self._map[byte_index]
+                self._map[byte_index] = value | (1 << (offset & 7))
+            base = table + i * SHM_MODULE_RECORD_SIZE
+            struct.pack_into(
+                "<QQIIIIQQ", self._map, base,
+                0, 0,
+                _stable_name_hash(cfg.get("name", "")),
+                1 if cfg.get("trace", True) else 0,
+                bitmap_cursor,
+                bit_count,
+                0, 0,
+            )
+            bitmap_cursor += _align(byte_count)
+
+    def _event_ring_offset(self) -> int:
+        active = self._read_u32("active_read_buffer")
+        if active == 1:
+            return self._layout["event_ring1_offset"]
+        return self._layout["event_ring0_offset"]
+
+    def _high_watermark_count(self) -> int:
+        return max(1, self.record_capacity * self.high_watermark_percent // 100)
+
+    def _read_u32(self, field: str) -> int:
+        return struct.unpack_from("<I", self._map, SHM_HEADER_OFFSETS[field])[0]
+
+    def _read_u64(self, field: str) -> int:
+        return struct.unpack_from("<Q", self._map, SHM_HEADER_OFFSETS[field])[0]
+
+    def _write_u32(self, field: str, value: int) -> None:
+        struct.pack_into("<I", self._map, SHM_HEADER_OFFSETS[field], int(value))
+
+    def _write_u64(self, field: str, value: int) -> None:
+        struct.pack_into("<Q", self._map, SHM_HEADER_OFFSETS[field], int(value))
+
+
+def _run_shared_memory_synthetic_checks() -> str:
+    shm = SharedTraceMemory(
+        main_pid=os.getpid(),
+        main_tid=1,
+        target_configs=[{
+            "name": "sample.exe",
+            "trace": True,
+            "function_starts": ["0x10", "0x20"],
+        }],
+        record_capacity=4,
+    )
+    try:
+        shm.write_synthetic_event(0, 11, 0, 0x1000, 0x2000, flags=0x3)
+        events = shm.drain_events()
+        assert len(events) == 1
+        assert events[0]["k"] == 0
+        assert events[0]["src"] == "0x1000"
+        assert events[0]["dst_tt"] is True
+        shm.request_stop()
+        assert shm.wait_for_wakeup(1000) is True
+        return "OK shared memory synthetic checks"
+    finally:
+        shm.close()
+
+
+# ============================================================
 # TraceSession
 # ============================================================
 
@@ -2530,6 +2894,7 @@ class FridaWorker(QObject):
         self._chunk_handle_events: list[dict] = []
         self._chunk_exception_events: list[dict] = []
         self._session_id: Optional[str] = None
+        self._shared_trace: Optional[SharedTraceMemory] = None
 
     def start_trace(self):
         dbg("start_trace requested: target={}".format(self._target))
@@ -2558,6 +2923,13 @@ class FridaWorker(QObject):
             dbg("frida.spawn ok: pid={}".format(self._pid))
             self.target_spawned.emit(int(self._pid), self._target)
             initial_tids  = enumerate_process_threads(self._pid)
+            main_tid = initial_tids[0] if initial_tids else 0
+            self._shared_trace = SharedTraceMemory(
+                int(self._pid), int(main_tid), self._target_configs)
+            dbg("shared trace created: name={} wake={} size={}".format(
+                self._shared_trace.name,
+                self._shared_trace.wake_event_name,
+                self._shared_trace.size))
             dbg("frida.attach begin: pid={}".format(self._pid))
             self._session = frida.attach(self._pid)
             self._session.on("detached", self._on_detached)
@@ -2608,6 +2980,12 @@ class FridaWorker(QObject):
             return
         self._stopping = True
         self.status_changed.emit("트레이스 강제 종료 요청")
+        if self._shared_trace:
+            try:
+                self._shared_trace.request_stop()
+                dbg("shared trace stop requested")
+            except Exception as e:
+                dbg("shared trace stop request failed: {!r}".format(e))
 
         if self._script and not self._done:
             done = threading.Event()
@@ -2777,6 +3155,15 @@ class FridaWorker(QObject):
 
     def _cleanup(self):
         dbg("cleanup begin")
+        if self._shared_trace:
+            try:
+                dbg("shared trace close begin")
+                self._shared_trace.close()
+                dbg("shared trace close ok")
+            except Exception as e:
+                dbg("shared trace close exception: {!r}".format(e))
+            finally:
+                self._shared_trace = None
         for obj, m in [(self._script, "unload"), (self._session, "detach")]:
             if m == "detach" and self._detached:
                 dbg("cleanup detach skipped: already detached")

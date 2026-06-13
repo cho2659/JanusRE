@@ -60,8 +60,10 @@ agent 변경 전에 Python 쪽 공유 메모리 생성, config writer, binary re
 
 - `bridge_server.py`에 공유 메모리 관리 클래스를 추가한다.
   - Windows named file mapping 생성.
+  - 위험 수위 wakeup용 Windows Event Object 생성.
   - header/config/module/function-start 영역 초기화.
   - read/write index와 state field 접근 API 제공.
+  - Blocking Flag와 double buffering config 기록.
   - stop 요청 시 `STOP_REQUESTED` state 또는 command field 기록.
 - target config 준비 후 공유 메모리에 module/function-start config를 기록한다.
 - binary event reader adapter를 추가한다.
@@ -123,6 +125,9 @@ trace 수집 경로의 agent 내부 `Memory.alloc`, JS 이벤트 배열, JSON tr
   - Python 공유 메모리 영역 안의 classifier table, bitmap, transition queue, callout data 영역을 사용하도록 변경.
   - Stalker `onReceive`에서 `Stalker.parse()` 후 JS dict 생성 대신 binary event record write로 전환하거나, 가능한 경우 native writer callout 중심으로 축소.
   - ring write index는 atomic increment/CModule helper로 갱신한다.
+  - ring buffer 80% 이상 사용 시 Windows Event Object를 signal한다.
+  - Blocking Flag가 켜진 무결성 모드에서는 full ring에서 drop하지 않고 reader 진행을 기다린다.
+  - double buffering flag가 켜진 경우 ring 0/1을 전환해 Python drain 지연에 대비한다.
 - `frida_agent/agent.js` 빌드 산출물 갱신.
 
 ### 검증

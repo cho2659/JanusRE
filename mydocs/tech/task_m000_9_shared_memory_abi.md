@@ -12,6 +12,7 @@ Python은 `agent.js` 로드 전에 다음 placeholder를 치환한다.
 |---|---|
 | `FRIDA_DELTA_SHM_NAME` | Windows named file mapping 이름. 예: `Local\\frida_delta_{pid}_{nonce}` |
 | `FRIDA_DELTA_SHM_SIZE` | mapping 전체 byte 크기 |
+| `FRIDA_DELTA_WAKE_EVENT_NAME` | ring buffer 위험 수위 도달 시 agent가 signal할 Windows Event Object 이름 |
 | `FRIDA_DELTA_MAIN_PID` | spawn된 main process pid |
 | `FRIDA_DELTA_MAIN_TID` | resume 전 Python이 열거한 main thread id |
 
@@ -27,7 +28,8 @@ agent는 RPC를 export하지 않는다. 시작 config와 stop command는 모두 
 | Module table | `module_table_offset` | `module_record_size * module_count` | Python | target module config |
 | Function-start bitmap | `function_bitmap_offset` | `function_bitmap_size` | Python | module별 함수 시작점 bitset |
 | Callout data arena | `callout_arena_offset` | `callout_arena_size` | agent atomic bump | Stalker callout user data |
-| Event ring | `event_ring_offset` | `record_size * record_capacity` | agent write, Python read | trace event records |
+| Event ring 0 | `event_ring0_offset` | `record_size * record_capacity` | agent write, Python read | trace event records |
+| Event ring 1 | `event_ring1_offset` | `record_size * record_capacity` | agent write, Python read | double buffering용 보조 ring |
 
 ## Header v1
 
@@ -38,7 +40,7 @@ agent는 RPC를 export하지 않는다. 시작 config와 stop command는 모두 
 | `0x06` | `u16` | header_size: `0x100` |
 | `0x08` | `u32` | state |
 | `0x0C` | `u32` | command |
-| `0x10` | `u32` | flags |
+| `0x10` | `u32` | config_flags |
 | `0x14` | `u32` | last_error |
 | `0x18` | `u32` | main_pid |
 | `0x1C` | `u32` | main_tid |
@@ -56,12 +58,28 @@ agent는 RPC를 export하지 않는다. 시작 config와 stop command는 모두 
 | `0x5C` | `u32` | callout_arena_offset |
 | `0x60` | `u32` | callout_arena_size |
 | `0x64` | `u32` | callout_arena_write_offset |
-| `0x68` | `u32` | event_ring_offset |
+| `0x68` | `u32` | event_ring0_offset |
 | `0x6C` | `u32` | status_code |
 | `0x70` | `u64` | oep_observed_at_seq |
-| `0x78` | `u64` | reserved |
+| `0x78` | `u32` | event_ring1_offset |
+| `0x7C` | `u32` | active_write_buffer |
+| `0x80` | `u32` | active_read_buffer |
+| `0x84` | `u32` | high_watermark_percent |
+| `0x88` | `u64` | wake_event_signal_count |
+| `0x90` | `u64` | blocking_wait_count |
+| `0x98` | `u64` | reserved |
 
 `write_index`, `seq_counter`, `callout_arena_write_offset`, `state` 전환은 agent의 atomic helper가 갱신한다. Python은 `read_index`, `command`를 갱신한다.
+
+## Config Flags
+
+| Bit | 이름 | 의미 |
+|---:|---|---|
+| `0` | `BLOCK_ON_FULL` | ring buffer가 꽉 차면 agent writer thread가 Python reader 진행을 기다린다. 무결성 모드다. |
+| `1` | `DOUBLE_BUFFERING` | event ring 0/1을 번갈아 사용한다. |
+| `2` | `WAKE_ON_HIGH_WATERMARK` | 사용량이 `high_watermark_percent` 이상이면 Windows Event Object를 signal한다. 기본 80%. |
+
+기본값은 `DOUBLE_BUFFERING | WAKE_ON_HIGH_WATERMARK`다. `BLOCK_ON_FULL`은 데이터 무결성이 정지 리스크보다 중요할 때만 켠다.
 
 ## State
 
@@ -130,13 +148,17 @@ agent writer:
 1. `seq = atomic_fetch_add(seq_counter, 1)`
 2. `slot = atomic_fetch_add(write_index, 1)`
 3. `slot - read_index >= record_capacity`이면 `dropped_count`를 증가시키고 기록하지 않는다.
-4. record 위치는 `event_ring_offset + (slot % record_capacity) * record_size`.
+4. record 위치는 `event_ring{active_write_buffer}_offset + (slot % record_capacity) * record_size`.
+5. 사용량이 `record_capacity * high_watermark_percent / 100` 이상이면 `FRIDA_DELTA_WAKE_EVENT_NAME` event를 signal한다.
+6. `BLOCK_ON_FULL`이 켜져 있고 ring이 full이면 writer는 Python이 `read_index`를 전진시킬 때까지 짧게 wait한다.
 
 Python reader:
 
 1. `write_index` snapshot을 읽는다.
 2. `read_index < write_index` 동안 record를 읽는다.
 3. 읽은 count만큼 `read_index`를 갱신한다.
+4. 위험 수위 event를 wait하고 깨어나면 즉시 drain한다. periodic poll은 fallback으로만 둔다.
+5. double buffering이 켜져 있고 active write ring이 포화에 가까우면 Python은 drain 완료 후 active read/write buffer 전환을 허용한다.
 
 초기 구현은 단일 agent writer 관점으로 시작하되, Stalker callback이 여러 thread에서 동시에 들어올 수 있으므로 write index와 seq는 반드시 atomic operation으로 갱신한다.
 
