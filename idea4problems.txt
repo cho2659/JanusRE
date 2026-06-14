@@ -1,18 +1,27 @@
-bitmap mutex 구현 필요
+bitmap Spinlock(스핀락)을 원시 타입(Atomic)으로 구현 필요 TCC 및 성능 고려
 
 
 thread suspend 교착 상태 해결 필요
 OEP 이후에도 교착 상태 (thread suspend 및 메모리 alloc 문제인 듯), load 시 lock 상태 
-SetUnhandledExceptionFilter
--> 해결 불가의 경우 thread suspend를 제거하여 정확도를 희생 (권장 안 함)
+loader lock가 원인
 
-공유 메모리: rpc 병목 완화 # 레거시 버리기 필요
+LdrLockLoaderLock
+
+Disposition=1 no loader lock
+
+Active Polling (Try-Lock) (LdrLockLoaderLock) // dbg에서 breakpoint 감지되지 않음
+
+https://elliotonsecurity.com/what-is-loader-lock/
+
+LDR_LOCK_LOADER_LOCK_FLAG_TRY_ONLY
+
+공유 메모리: rpc 병목 제거 # 레거시 버리기 필요
 
 스레드 별로 공유 메모리 분리 필수 (tt, tf 판단, 터널 구축에 필수)
 
-resolve ordinal with ghidra export symbols (ex) mfc dll
+stalker unfollow 필요
 
-codex의 미구현 코드가 존재할 것으로 의심됨 확인 후 진행 및 새 코드 삽입 필요 
+resolve ordinal with ghidra export symbols (ex) mfc dll
 
 과도기라고 판단될 경우 레거시 코드 무시 후 새로 만드는 것이 필요함 (껍데기만 만들고 사기치는 경우 있으니 주의 필요)
 
